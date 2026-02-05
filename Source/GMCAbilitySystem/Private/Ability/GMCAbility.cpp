@@ -109,8 +109,15 @@ bool UGMCAbility::CanAffordAbilityCost(float DeltaTime) const
 			if (Attribute->Tag.MatchesTagExact(AttributeModifier.AttributeTag))
 			{
 				AttributeModifier.InitModifier(AbilityEffect, OwnerAbilityComponent->ActionTimer, -1.f, false, DeltaTime);
-				if (Attribute->Value + AttributeModifier.CalculateModifierValue(*Attribute) < 0.f)
+
+				float result = Attribute->Value + AttributeModifier.CalculateModifierValue(*Attribute);
+
+				if (result <= 0.f)
 				{
+					return false;
+				}
+
+				if (FMath::IsNearlyZero(result)) {
 					return false;
 				}
 			}
