@@ -242,6 +242,11 @@ void UGMC_AbilitySystemComponent::RemoveGrantedAbilityByTag(const FGameplayTag A
 	}
 }
 
+FGameplayTagContainer UGMC_AbilitySystemComponent::GetGrantedAbilityTags() const
+{
+	return GrantedAbilityTags;
+}
+
 bool UGMC_AbilitySystemComponent::HasGrantedAbilityTag(const FGameplayTag GameplayTag) const
 {
 	return GrantedAbilityTags.HasTagExact(GameplayTag);
