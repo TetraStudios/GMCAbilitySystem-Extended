@@ -258,7 +258,8 @@ public:
 	virtual void OnGameplayTaskInitialized(UGameplayTask& Task) override;
 	virtual void OnGameplayTaskActivated(UGameplayTask& Task) override;
 	virtual void OnGameplayTaskDeactivated(UGameplayTask& Task) override;
-	
+
+
 private:
 
 	void FinishEndAbility();
@@ -278,9 +279,6 @@ private:
 	/** List of currently active tasks, do not modify directly */
 	UPROPERTY()
 	TArray<TObjectPtr<UGameplayTask>> ActiveTasks;
-
-	UPROPERTY(BlueprintReadOnly)
-	UGMCAbilityEffect* AbilityCostInstance = nullptr;
 
 	bool IsOnCooldown() const;
 

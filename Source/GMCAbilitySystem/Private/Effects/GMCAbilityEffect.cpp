@@ -157,8 +157,6 @@ void UGMCAbilityEffect::EndEffect()
 	EndEffectEvent();
 }
 
-void UGMCAbilityEffect::BeginPlay() {
-}
 void UGMCAbilityEffect::BeginDestroy() {
 
 
