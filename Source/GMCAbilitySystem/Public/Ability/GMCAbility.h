@@ -44,6 +44,10 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "GMCAbilitySystem")
 	FGMCAbilityData AbilityData;
 
+	UPROPERTY(BlueprintReadOnly)
+	UGMCAbilityEffect* AbilityCostInstance = nullptr;
+
+
 	// Assign a new, incrementing, Task ID
 	UFUNCTION()
 	int GetNextTaskID(){TaskIDCounter += 1;
@@ -296,7 +300,7 @@ private:
 	UPROPERTY()
 	TArray<TObjectPtr<UGameplayTask>> ActiveTasks;
 
-	UPROPERTY()
+	UPROPERTY(BlueprintReadOnly)
 	UGMCAbilityEffect* AbilityCostInstance = nullptr;
 
 	bool IsOnCooldown() const;

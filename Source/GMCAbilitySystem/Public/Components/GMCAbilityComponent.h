@@ -257,6 +257,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
 	void RemoveGrantedAbilityByTag(const FGameplayTag AbilityTag);
 
+	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
+	FGameplayTagContainer GetGrantedAbilityTags() const;
+
 	UFUNCTION(BlueprintPure, meta=(Categories="Ability"), Category = "GMCAbilitySystem")
 	bool HasGrantedAbilityTag(const FGameplayTag GameplayTag) const;
 

@@ -25,8 +25,12 @@ void UGMCAbilityEffect::InitializeEffect(FGMCAbilityEffectData InitializationDat
 	
 	if (OwnerAbilityComponent == nullptr)
 	{
-		UE_LOG(LogGMCAbilitySystem, Error, TEXT("OwnerAbilityComponent is null in UGMCAbilityEffect::InitializeEffect"));
-		return;
+		if (EffectData.SourceAbilityComponent == nullptr)
+		{
+			UE_LOG(LogGMCAbilitySystem, Error, TEXT("OwnerAbilityComponent is null in UGMCAbilityEffect::InitializeEffect"));
+			return;
+		}
+		OwnerAbilityComponent = EffectData.SourceAbilityComponent;
 	}
 	
 	ClientEffectApplicationTime = OwnerAbilityComponent->ActionTimer;
@@ -190,7 +194,8 @@ void UGMCAbilityEffect::EndEffect()
 	}
 }
 
-
+void UGMCAbilityEffect::BeginPlay() {
+}
 void UGMCAbilityEffect::BeginDestroy() {
 
 
