@@ -72,30 +72,56 @@ void FGMASBoundQueueV2::BindToGMC(UGMC_MovementUtilityCmp* MovementComponent)
 
 void FGMASBoundQueueV2::GenPreLocalMoveExecution()
 {
-	// UE_LOG(LogTemp, Warning, TEXT("OperationDataType: %s"), *OperationData.GetScriptStruct()->GetName());
-	// Client Logic
-	if (GMCMovementComponent->GetNetMode() == NM_Client ||
-		GMCMovementComponent->GetNetMode() == NM_Standalone ||
-		GMCMovementComponent->IsLocallyControlledListenServerPawn() ||
-		GMCMovementComponent->IsLocallyControlledDedicatedServerPawn())
+	// Only locally-controlled "client-like" pawns drive this path; remote pawns on
+	// the server have their bound variable populated by GMC's replication layer.
+	if (GMCMovementComponent->GetNetMode() != NM_Client &&
+		GMCMovementComponent->GetNetMode() != NM_Standalone &&
+		!GMCMovementComponent->IsLocallyControlledListenServerPawn() &&
+		!GMCMovementComponent->IsLocallyControlledDedicatedServerPawn())
 	{
-		// Get a pending operation
-		if (ClientQueuedOperations.Num() > 0)
+		return;
+	}
+
+	if (ClientQueuedOperations.Num() > 0)
+	{
+		const int OperationIDToProcess = ClientQueuedOperations.Pop();
+		if (OperationPayloads.Contains(OperationIDToProcess))
 		{
-			const int OperationIDToProcess = ClientQueuedOperations.Pop();
-			if (OperationPayloads.Contains(OperationIDToProcess))
-			{
-				// Replicate the full derived payload (e.g. FGMASBoundQueueV2AbilityActivationOperation
-				// with InputTag) so that ServerProcessOperation->IsValidClientOperation passes
-				// on the receiving end. Sending only the base struct (just OperationID) causes
-				// IsValidClientOperation to return false and the ability is never run server-side.
-				OperationData = OperationPayloads[OperationIDToProcess];
-			}
+			// Replicate the full derived payload (e.g. FGMASBoundQueueV2AbilityActivationOperation
+			// with InputTag) so that ServerProcessOperation->IsValidClientOperation passes
+			// on the receiving end. Sending only the base struct (just OperationID) causes
+			// IsValidClientOperation to return false and the ability is never run server-side.
+			OperationData = OperationPayloads[OperationIDToProcess];
+			return;
 		}
-		else
-		{
-			OperationData = FInstancedStruct::Make<FGMASBoundQueueV2OperationBaseData>();
-		}
+	}
+
+	// On a remote client (NM_Client), ProcessOperation does NOT remove the payload
+	// from the cache (the HasAuthority gate at GMCAbilityComponent.cpp:~1696 skips
+	// it), so cache presence is not a reliable "consumed" signal — the op lingers
+	// until ClearStaleOperationData ages it out. Always clobber here to avoid the
+	// bound variable re-replicating the same activation op every frame, which
+	// would cause the server to re-activate the ability immediately after a task
+	// progress signal (e.g. WaitForInputKeyRelease) had ended it.
+	if (GMCMovementComponent->GetNetMode() == NM_Client)
+	{
+		OperationData = FInstancedStruct::Make<FGMASBoundQueueV2OperationBaseData>();
+		return;
+	}
+
+	// Authority side (host on listen server, AI on dedicated, standalone): only
+	// clear OperationData if its current op has already been consumed (no longer
+	// in cache). Otherwise leave it intact so a deferred op — one ProcessOperation
+	// rejected on tick mismatch — survives until the matching tick consumes it.
+	// Without this guard, a tick-mismatched op gets silently dropped because
+	// ProcessOperation's bActivateOnMovementTick check returns false but the cache
+	// has already been cleared.
+	const FGMASBoundQueueV2OperationBaseData* CurrentBaseData =
+		OperationData.GetPtr<FGMASBoundQueueV2OperationBaseData>();
+	const int CurrentOpID = CurrentBaseData ? CurrentBaseData->OperationID : 0;
+	if (CurrentOpID == 0 || !OperationPayloads.Contains(CurrentOpID))
+	{
+		OperationData = FInstancedStruct::Make<FGMASBoundQueueV2OperationBaseData>();
 	}
 }
 
@@ -178,12 +204,22 @@ void FGMASBoundQueueV2::CheckValidState() const
 			UE_LOG(LogGMCAbilitySystem, Error, TEXT("ClientQueuedOperations has %d pending operations on server"), ClientQueuedOperations.Num());
 		}
 
-		// Check OperationPayloads for invalid IDs (-1 is reserved for client-made operations)
-		for (auto operation : OperationPayloads)
+		// Negative IDs in OperationPayloads on the server are normal and transient:
+		// ServerProcessOperation caches the client's submitted op before dispatching,
+		// and ProcessOperation may defer dispatch to the matching tick (Movement vs
+		// Ancillary) to satisfy the ability's bActivateOnMovementTick preference.
+		// During that defer the negative ID lingers for at most a few ticks until
+		// the matching tick consumes it; ClearStaleOperationData() handles anything
+		// stuck longer than MoveHistoryMaxSize. Only warn about IDs that have aged
+		// past the cache horizon, since those indicate a real leak.
+		const int64 MaximumFreshMoveIndex = GMCMoveCounter - GMCMovementComponent->MoveHistoryMaxSize;
+		for (const auto& Expiration : OperationDataCacheExpiration)
 		{
-			if (operation.Key < 0)
+			if (Expiration.OperationID < 0 && Expiration.ModeAddedAt < MaximumFreshMoveIndex)
 			{
-				UE_LOG(LogGMCAbilitySystem, Error, TEXT("OperationPayloads has invalid operation ID %d on server"), operation.Key);
+				UE_LOG(LogGMCAbilitySystem, Error,
+					TEXT("OperationPayloads has stale client-side operation ID %d on server (added at move %lld, cutoff %lld)"),
+					Expiration.OperationID, Expiration.ModeAddedAt, MaximumFreshMoveIndex);
 			}
 		}
 	}

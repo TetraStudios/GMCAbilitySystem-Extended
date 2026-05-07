@@ -761,6 +761,24 @@ void UGMC_AbilitySystemComponent::GenPredictionTick(float DeltaTime)
 	}
 	else
 	{
+		// Authority side only (host on listen server, AI on dedicated, standalone):
+		// pop the next queued op into OperationData so the prediction tick can run
+		// abilities with bActivateOnMovementTick=true (the default). The smart
+		// GenPreLocalMoveExecution preserves OperationData if BP wiring already
+		// populated it pre-move, so this is safe for both wired and unwired
+		// authority-side projects.
+		//
+		// Clients are intentionally skipped: GMC's PreLocalMoveExecution event (BP-
+		// wired to ASC.PreLocalMoveExecution) is the canonical place where the
+		// client populates OperationData *before* ProcessSyncData(Save) captures
+		// it for the outbound move. Calling GenPreLocalMoveExecution again here
+		// for a client would clobber that pre-populated value (queue is already
+		// drained, NM_Client branch in GenPreLocalMoveExecution always clobbers),
+		// so we leave the client path entirely to BP wiring.
+		if (HasAuthority())
+		{
+			BoundQueueV2.GenPreLocalMoveExecution();
+		}
 		ProcessOperation(BoundQueueV2.OperationData, true);
 	}
 	
@@ -1690,13 +1708,50 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 	// Pull actual payload from operation cache
 	FInstancedStruct PayloadData = BoundQueueV2.GetPayloadByID(OperationID);
 
+	const UScriptStruct* StructType = PayloadData.GetScriptStruct();
+
+	// Defer only when the ability wants the ancillary tick but we're currently on
+	// the movement (prediction) tick. The matching ancillary tick is yet to come
+	// in this engine tick — preserving the cache lets it activate there. Without
+	// this defer, RemovePayloadByID would run before TryActivateAbilitiesByInputTag's
+	// bActivateOnMovementTick check, silently dropping the op.
+	//
+	// We do NOT defer the reverse direction (ability wants movement, we're on
+	// ancillary). The matching movement tick already ran for this op — it either
+	// activated (cache cleared) or also deferred (cache stays). Falling through
+	// to the existing dispatch handles both cases: TryActivate returns false on
+	// the tick mismatch, and the cache gets cleared as a normal side effect on
+	// the server, avoiding cache leak on `OperationPayloads` /
+	// `OperationDataCacheExpiration` from the server's per-move ancillary tick
+	// re-caching the op via ServerProcessOperation.
+	if (!bForce && StructType == FGMASBoundQueueV2AbilityActivationOperation::StaticStruct())
+	{
+		const FGMASBoundQueueV2AbilityActivationOperation& AbActivation =
+			PayloadData.Get<FGMASBoundQueueV2AbilityActivationOperation>();
+		const auto Granted = GetGrantedAbilitiesByTag(AbActivation.InputTag);
+		if (Granted.Num() > 0)
+		{
+			const bool bAbilityWantsMovementTick =
+				Granted[0]->GetDefaultObject<UGMCAbility>()->bActivateOnMovementTick;
+			if (!bAbilityWantsMovementTick && bFromMovementTick)
+			{
+				if (GMASApplyTrace::CVarLogApplyTrace.GetValueOnGameThread())
+				{
+					UE_LOG(LogGMCAbilitySystem, Warning,
+						TEXT("[ProcessOpDefer] op=%d activate_ability tag=%s wantsMove=0 gotMove=1 auth=%d"),
+						OperationID, *AbActivation.InputTag.ToString(),
+						HasAuthority() ? 1 : 0);
+				}
+				return false;
+			}
+		}
+	}
+
 	// Server only ever processes operations once so it doesn't need them cached
 	if (HasAuthority())
 	{
 		BoundQueueV2.RemovePayloadByID(OperationID);
 	}
-	
-	const UScriptStruct* StructType = PayloadData.GetScriptStruct();
 
 	// Activate Ability
 	if (StructType == FGMASBoundQueueV2AbilityActivationOperation::StaticStruct())
