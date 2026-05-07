@@ -300,9 +300,6 @@ private:
 	UPROPERTY()
 	TArray<TObjectPtr<UGameplayTask>> ActiveTasks;
 
-	UPROPERTY(BlueprintReadOnly)
-	UGMCAbilityEffect* AbilityCostInstance = nullptr;
-
 	bool IsOnCooldown() const;
 
 public:
