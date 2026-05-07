@@ -204,15 +204,19 @@ void UGMC_AbilitySystemComponent::GenAncillaryTick(float DeltaTime, bool bIsComb
 	if (HasAuthority())
 	{
 		// Server processes client output payloads — only for REMOTE client pawns.
-		// The listen server's own locally-controlled pawn does not submit "client
-		// data" to itself, so SV_GetLastClientData().OutputState.InstancedStructs
-		// is empty on the first frame, causing an out-of-bounds crash when
-		// GetBoundInstancedStruct tries to access index BI_OperationData.
+		// The listen server's own locally-controlled pawn never submits client data
+		// to itself. For remote pawns, SV_GetLastClientData().OutputState is also
+		// default-constructed (empty InstancedStruct AliasData) until the first
+		// client move actually lands on the server — guard with Num() or
+		// GetBoundInstancedStruct will OOB-index the empty array.
 		if (GMCMovementComponent->IsPlayerControlledPawn() && !GMCMovementComponent->IsLocallyControlledListenServerPawn())
 		{
 			const FGMC_PawnState OutputState = GMCMovementComponent->SV_GetLastClientData().OutputState;
-			const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
-			ServerProcessOperation(ClientPayloadOperationData, false);
+			if (OutputState.InstancedStruct.Num() > BoundQueueV2.BI_OperationData)
+			{
+				const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
+				ServerProcessOperation(ClientPayloadOperationData, false);
+			}
 		}
 		// Server owned pawns
 		BoundQueueV2.GenPreLocalMoveExecution();
@@ -750,12 +754,17 @@ void UGMC_AbilitySystemComponent::GenPredictionTick(float DeltaTime)
 
 	// Same listen-server guard as GenAncillaryTick: skip client payload processing
 	// for the locally-controlled host pawn (no client data submitted to itself).
+	// The Num() check also covers remote pawns whose first client move hasn't yet
+	// landed — OutputState is default-constructed and its InstancedStruct AliasData
+	// is empty, which would OOB-index inside GetBoundInstancedStruct.
 	if (HasAuthority() && GMCMovementComponent->IsPlayerControlledPawn() && !GMCMovementComponent->IsLocallyControlledListenServerPawn())
 	{
-		// Server processes client output payloads
 		const FGMC_PawnState OutputState = GMCMovementComponent->SV_GetLastClientData().OutputState;
-		const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
-		ServerProcessOperation(ClientPayloadOperationData, true);
+		if (OutputState.InstancedStruct.Num() > BoundQueueV2.BI_OperationData)
+		{
+			const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
+			ServerProcessOperation(ClientPayloadOperationData, true);
+		}
 	}
 	else
 	{
