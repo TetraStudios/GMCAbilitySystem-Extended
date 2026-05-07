@@ -203,20 +203,17 @@ void UGMC_AbilitySystemComponent::GenAncillaryTick(float DeltaTime, bool bIsComb
 
 	if (HasAuthority())
 	{
-		// Server processes client output payloads — only for REMOTE client pawns.
-		// The listen server's own locally-controlled pawn never submits client data
-		// to itself. For remote pawns, SV_GetLastClientData().OutputState is also
-		// default-constructed (empty InstancedStruct AliasData) until the first
-		// client move actually lands on the server — guard with Num() or
-		// GetBoundInstancedStruct will OOB-index the empty array.
-		if (GMCMovementComponent->IsPlayerControlledPawn() && !GMCMovementComponent->IsLocallyControlledListenServerPawn())
+		// SV_GetLastClientData()'s LastRawMove is only populated while the server is
+		// actively executing a remote client's move. Outside that window it stays
+		// default-constructed and indexing OutputState.InstancedStruct OOB-crashes
+		// inside GetBoundInstancedStruct. SV_IsExecutingRemoteMoves() is GMC's own
+		// gate for this — naturally false for the listen-server's own pawn, AI
+		// pawns, and any pawn before its first remote move has been processed.
+		if (GMCMovementComponent->SV_IsExecutingRemoteMoves())
 		{
 			const FGMC_PawnState OutputState = GMCMovementComponent->SV_GetLastClientData().OutputState;
-			if (OutputState.InstancedStruct.Num() > BoundQueueV2.BI_OperationData)
-			{
-				const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
-				ServerProcessOperation(ClientPayloadOperationData, false);
-			}
+			const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
+			ServerProcessOperation(ClientPayloadOperationData, false);
 		}
 		// Server owned pawns
 		BoundQueueV2.GenPreLocalMoveExecution();
@@ -752,19 +749,15 @@ void UGMC_AbilitySystemComponent::GenPredictionTick(float DeltaTime)
 	// Drain any PredictedQueued operations buffered since the last tick.
 	DrainPendingPredictedOperations();
 
-	// Same listen-server guard as GenAncillaryTick: skip client payload processing
-	// for the locally-controlled host pawn (no client data submitted to itself).
-	// The Num() check also covers remote pawns whose first client move hasn't yet
-	// landed — OutputState is default-constructed and its InstancedStruct AliasData
-	// is empty, which would OOB-index inside GetBoundInstancedStruct.
-	if (HasAuthority() && GMCMovementComponent->IsPlayerControlledPawn() && !GMCMovementComponent->IsLocallyControlledListenServerPawn())
+	// SV_IsExecutingRemoteMoves() is GMC's gate for "we're currently processing a
+	// remote client's move" — the only window in which SV_GetLastClientData() is
+	// meaningful. Outside it (listen-server's own pawn, AI, pre-first-move) the
+	// LastRawMove is default-constructed and OutputState.InstancedStruct OOBs.
+	if (HasAuthority() && GMCMovementComponent->SV_IsExecutingRemoteMoves())
 	{
 		const FGMC_PawnState OutputState = GMCMovementComponent->SV_GetLastClientData().OutputState;
-		if (OutputState.InstancedStruct.Num() > BoundQueueV2.BI_OperationData)
-		{
-			const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
-			ServerProcessOperation(ClientPayloadOperationData, true);
-		}
+		const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
+		ServerProcessOperation(ClientPayloadOperationData, true);
 	}
 	else
 	{
