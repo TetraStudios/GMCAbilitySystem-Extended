@@ -194,8 +194,6 @@ void UGMCAbilityEffect::EndEffect()
 	}
 }
 
-void UGMCAbilityEffect::BeginPlay() {
-}
 void UGMCAbilityEffect::BeginDestroy() {
 
 
