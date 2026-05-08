@@ -259,6 +259,11 @@ public:
 	virtual void OnGameplayTaskActivated(UGameplayTask& Task) override;
 	virtual void OnGameplayTaskDeactivated(UGameplayTask& Task) override;
 
+protected:
+
+	// How long to wait for the server to confirm an ability before the client cancels it.
+	UPROPERTY(AdvancedDisplay, EditDefaultsOnly, Category="GMCAbilitySystem")
+	float ServerConfirmTimeout = 2.f;
 
 private:
 
@@ -271,10 +276,7 @@ private:
 
 	bool bEndPending = false;
 
-	float ClientStartTime;
-	
-	// How long to wait for server to confirm ability before cancelling on client
-	float ServerConfirmTimeout = 1.f;
+	float ClientStartTime = 0.f;
 
 	/** List of currently active tasks, do not modify directly */
 	UPROPERTY()

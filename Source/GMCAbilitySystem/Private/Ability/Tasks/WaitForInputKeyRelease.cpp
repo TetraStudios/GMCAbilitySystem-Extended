@@ -30,8 +30,8 @@ void UGMCAbilityTask_WaitForInputKeyRelease::Activate()
 
 		InputBindingHandle = Binding.GetHandle();
 		
-		// Check that the value isn't currently false.
-		if (bShouldCheckForReleaseDuringActivation)
+		// Only a locally controlled client or listen-server host can read the real input state.
+		if (bShouldCheckForReleaseDuringActivation && IsClientOrRemoteListenServerPawn())
 		{
 			FInputActionValue ActionValue = FInputActionValue();
 			APlayerController* PC = AbilitySystemComponent->GetOwner()->GetInstigatorController<APlayerController>();

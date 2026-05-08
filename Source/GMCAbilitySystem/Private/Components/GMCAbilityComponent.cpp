@@ -806,7 +806,7 @@ void UGMC_AbilitySystemComponent::TickActiveEffects(float DeltaTime)
 	for (const TPair<int, UGMCAbilityEffect*>& Effect : ActiveEffects)
 	{
 		
-		if (!Effect.Value->IsValidLowLevel()) {
+		if (!IsValid(Effect.Value) || !Effect.Value->IsValidLowLevel()) {
 			UE_LOG(LogGMCAbilitySystem, Error, TEXT("Active Effect id %d is null or pending kill, removing from the list."), Effect.Key);
 			CompletedActiveEffects.Push(Effect.Key);
 			continue;	
@@ -840,6 +840,7 @@ void UGMC_AbilitySystemComponent::TickActiveEffects(float DeltaTime)
 		
 		ActiveEffects.Remove(EffectID);
 		ActiveEffectsData.RemoveAll([EffectID](const FGMCAbilityEffectData& EffectData) {return EffectData.EffectID == EffectID;});
+		ProcessedEffectIDs.Remove(EffectID);
 	}
 
 	// Clean effect handles
@@ -924,19 +925,37 @@ void UGMC_AbilitySystemComponent::OnRep_ActiveEffectsData()
 
 void UGMC_AbilitySystemComponent::CheckRemovedEffects()
 {
+	TArray<int> EffectsToRemove;
+
 	for (TPair<int, UGMCAbilityEffect*> Effect : ActiveEffects)
 	{
 		// Ensure this effect has been processed locally
-		if (!ProcessedEffectIDs.Contains(Effect.Key)){return;}
+		if (!ProcessedEffectIDs.Contains(Effect.Key)){continue;}
 
 		// Ensure this effect has already been confirmed by the server so that if it's now missing,
 		// it means the server removed it
-		if (ProcessedEffectIDs[Effect.Key] == EGMCEffectAnswerState::Pending){return;}
+		if (ProcessedEffectIDs[Effect.Key] == EGMCEffectAnswerState::Pending){continue;}
+
+		if (Effect.Value)
+		{
+			const float TimeSinceApply = ActionTimer - Effect.Value->ClientEffectApplicationTime;
+			const float ReplicationGracePeriod = Effect.Value->EffectData.ClientGraceTime;
+			if (TimeSinceApply < ReplicationGracePeriod) { continue; }
+		}
 		
 		if (!ActiveEffectsData.ContainsByPredicate([Effect](const FGMCAbilityEffectData& EffectData) {return EffectData.EffectID == Effect.Key;}))
 		{
-			RemoveActiveAbilityEffect(Effect.Value);
+			if (Effect.Value) { Effect.Value->EndEffect(); }
+			EffectsToRemove.Add(Effect.Key);
 		}
+	}
+
+	for (const int EffectID : EffectsToRemove)
+	{
+		if (HasAuthority()) { RPCClientEndEffect(EffectID); }
+		ActiveEffects.Remove(EffectID);
+		ActiveEffectsData.RemoveAll([EffectID](const FGMCAbilityEffectData& EffectData) { return EffectData.EffectID == EffectID; });
+		ProcessedEffectIDs.Remove(EffectID);
 	}
 }
 
@@ -1042,7 +1061,7 @@ void UGMC_AbilitySystemComponent::RPCClientEndEffect_Implementation(int EffectID
 {
 	if (ActiveEffects.Contains(EffectID))
 	{
-		ActiveEffects[EffectID]->EndEffect();
+		RemoveActiveAbilityEffect(ActiveEffects[EffectID]);
 		UE_LOG(LogGMCAbilitySystem, VeryVerbose, TEXT("[RPC] Server Ended Effect: %d"), EffectID);
 	}
 }
@@ -1075,19 +1094,29 @@ void UGMC_AbilitySystemComponent::RPCConfirmAbilityActivation_Implementation(int
 
 
 void UGMC_AbilitySystemComponent::ApplyStartingEffects(bool bForce) {
-	if (HasAuthority() && StartingEffects.Num() > 0 && (bForce || !bStartingEffectsApplied))
+	if (!HasAuthority() || StartingEffects.Num() == 0 || (!bForce && bStartingEffectsApplied))
 	{
-		for (const TSubclassOf<UGMCAbilityEffect>& Effect : StartingEffects)
-		{
-			// Dont apply the same effect twice
-			if (!Algo::FindByPredicate(ActiveEffects, [Effect](const TPair<int, UGMCAbilityEffect*>& ActiveEffect) {
-				return IsValid(ActiveEffect.Value) && ActiveEffect.Value->GetClass() == Effect;
-			})) {
-				ApplyAbilityEffectShort(Effect, EGMCAbilityEffectQueueType::ServerAuth);
-			}
-		}
-		bStartingEffectsApplied = true;
+		return;
 	}
+
+	if (const APawn* OwnerPawn = Cast<APawn>(GetOwner()))
+	{
+		if (!OwnerPawn->GetController())
+		{
+			return;
+		}
+	}
+
+	for (const TSubclassOf<UGMCAbilityEffect>& Effect : StartingEffects)
+	{
+		// Dont apply the same effect twice
+		if (!Algo::FindByPredicate(ActiveEffects, [Effect](const TPair<int, UGMCAbilityEffect*>& ActiveEffect) {
+			return IsValid(ActiveEffect.Value) && ActiveEffect.Value->GetClass() == Effect;
+		})) {
+			ApplyAbilityEffectShort(Effect, EGMCAbilityEffectQueueType::ServerAuth);
+		}
+	}
+	bStartingEffectsApplied = true;
 }
 
 

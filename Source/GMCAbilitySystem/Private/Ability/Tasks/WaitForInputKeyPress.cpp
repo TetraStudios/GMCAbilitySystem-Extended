@@ -38,8 +38,8 @@ void UGMCAbilityTask_WaitForInputKeyPress::Activate()
 	
 		InputBindingHandle = Binding.GetHandle();
 
-		// Check if button was held when entering the task
-		if (bShouldCheckForPressDuringActivation)
+		// Only a locally controlled client or listen-server host can read the real input state.
+		if (bShouldCheckForPressDuringActivation && IsClientOrRemoteListenServerPawn())
 		{
 			FInputActionValue ActionValue = FInputActionValue();
 			APlayerController* PC = AbilitySystemComponent->GetOwner()->GetInstigatorController<APlayerController>();

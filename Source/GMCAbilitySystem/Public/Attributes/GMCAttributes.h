@@ -106,7 +106,9 @@ struct GMCABILITYSYSTEM_API FAttribute : public FFastArraySerializerItem
 
 protected:
 
-		UPROPERTY()
+		// Local runtime cache for temporal modifiers. The replicated attribute Value
+		// already carries the authoritative result for unbound attributes; bound
+		// attributes rebuild this cache locally during prediction and replay.
 		mutable TArray<FAttributeTemporaryModifier> ValueTemporalModifiers;
 
 		mutable bool bIsDirty = false;
