@@ -1,6 +1,5 @@
 ﻿#pragma once
 #include "GameplayTags.h"
-#include "Templates/SubclassOf.h"
 #include "GMCAttributeModifierCustom_Base.h"
 #include "GMCAttributeModifier.generated.h"
 
