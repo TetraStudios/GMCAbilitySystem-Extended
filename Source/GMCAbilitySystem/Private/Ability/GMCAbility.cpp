@@ -189,7 +189,7 @@ void UGMCAbility::CancelConflictingAbilities()
 		}
 
 		if (OwnerAbilityComponent->EndAbilitiesByTag(AbilityToCancelTag)) {
-			UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability (tag) %s has been cancelled by (tag) %s"), *AbilityTag.ToString(), *AbilityToCancelTag.ToString());
+			UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability (tag) %s cancelled ability tag %s"), *AbilityTag.ToString(), *AbilityToCancelTag.ToString());
 		}
 	}
 

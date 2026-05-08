@@ -41,7 +41,40 @@ struct  FGMASBoundQueueV2
 	TArray<FOperationDataCacheExpiration> OperationDataCacheExpiration;
 
 	void ClearStaleOperationData();
-	
+
+	// Idempotency for ability activation operations. Once an OperationID has been
+	// dispatched to TryActivateAbilitiesByInputTag, ProcessOperation drops every
+	// subsequent re-encounter of that ID until the marker ages out via
+	// ClearStaleProcessedOperations. Closes two re-feed paths that otherwise
+	// re-activate an ability whose Ended instance has already been reaped by
+	// CleanupStaleAbilities, briefly bringing it back to life right after the
+	// player's release path ended it:
+	//   - Client replay (CL_ReplayMoves re-runs GenPredictionTick on saved moves)
+	//   - Server SV_GetLastClientData() returning the same OutputState across
+	//     consecutive ticks before the next remote move arrives
+	// Effect / Impulse / Location ops are scoped out — those carry their own
+	// idempotency through ProcessEffectApplicationFromOperation's
+	// ActiveEffects.Contains check and similar.
+	TMap<int, int64> ProcessedOperations;
+
+	// Independent tick counter for ProcessedOperations expiration. The pre-existing
+	// GMCMoveCounter only increments on remote clients (the NM_Client gate in
+	// GenAncillaryTick), but the idempotency markers need expiration on every role
+	// — server, listen-server host, and standalone — so we track our own clock here.
+	int64 ProcessedOpTickCounter = 0;
+
+	void MarkOperationProcessed(int OperationID)
+	{
+		ProcessedOperations.Add(OperationID, ProcessedOpTickCounter);
+	}
+
+	bool IsOperationProcessed(int OperationID) const
+	{
+		return ProcessedOperations.Contains(OperationID);
+	}
+
+	void ClearStaleProcessedOperations();
+
 	int NextOperationID = 0;
 	
 	// Get the next operation ID
@@ -69,6 +102,11 @@ public:
 		{
 			OperationPayloads.Remove(OperationID);
 		}
+
+		OperationDataCacheExpiration.RemoveAll([OperationID](const FOperationDataCacheExpiration& Expiration)
+		{
+			return Expiration.OperationID == OperationID;
+		});
 	}
 
 	// Make a GetOperationByID
@@ -143,6 +181,14 @@ public:
 	// Queue a Client operation
 	void QueueClientOperation(const int OperationID);
 
+	// Queue a server-auth operation received by the client. These are local client
+	// mirror ops and must not share the outbound client operation stream.
+	void QueueServerMirrorOperation(const int OperationID);
+	bool PopNextServerMirrorOperation(FInstancedStruct& OutOperation);
+
+	// Queue an acknowledgement for a server-auth mirror op processed on the client.
+	void QueueAcknowledgement(const int OperationID);
+
 	// Queue a ServerAuth operation
 	void QueueServerOperation(const int OperationID, const float Timeout = 1.0f);
 	
@@ -157,6 +203,12 @@ public:
 	// Operations (referenced by ID to OperationPayloads) that the Client has queued
 	// Key: Operation Id
 	TArray<int> ClientQueuedOperations;
+
+	// Server-auth operations received by the client through RPC and mirrored locally.
+	TArray<int> ServerMirrorQueuedOperations;
+
+	// ACKs waiting to be emitted through the client-auth bound OperationData slot.
+	TArray<int> PendingAckOperations;
 
 	// Operations that the server has sent to the client but haven't been acknowledged yet
 	// If the client doesn't acknowledge the operation in time, the server will force it

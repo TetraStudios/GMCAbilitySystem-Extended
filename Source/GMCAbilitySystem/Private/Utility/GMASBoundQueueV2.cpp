@@ -5,13 +5,33 @@
 #include "GMCAbilitySystem.h"
 #include "GMCMovementUtilityComponent.h"
 
+namespace
+{
+	bool PopFirstOperationID(TArray<int>& Queue, int& OutOperationID)
+	{
+		if (Queue.Num() == 0)
+		{
+			return false;
+		}
+
+		OutOperationID = Queue[0];
+		Queue.RemoveAt(0, 1);
+		return true;
+	}
+}
 
 bool FGMASBoundQueueV2::IsValidGMASOperation(const FInstancedStruct& Data) const
 {
-	// Check if the operation is a valid type
-	if (!OperationData.IsValid()) return false;
+	// Validate the *incoming* Data, not the queue's bound `OperationData` member —
+	// they are unrelated on the server, where ServerProcessOperation passes the
+	// client's payload extracted from OutputState. Checking the bound member meant a
+	// server with an empty bound state silently rejected every client activation; on
+	// the client it accidentally validated only because the call site happens to
+	// pass the bound member by value. Validate the parameter directly so both sides
+	// behave consistently.
+	if (!Data.IsValid()) return false;
 
-	const FGMASBoundQueueV2OperationBaseData* BaseData = OperationData.GetPtr<FGMASBoundQueueV2OperationBaseData>();
+	const FGMASBoundQueueV2OperationBaseData* BaseData = Data.GetPtr<FGMASBoundQueueV2OperationBaseData>();
 	if (!BaseData)
 	{
 		UE_LOG(LogGMCAbilitySystem, Error, TEXT("OperationData is not a valid type"));
@@ -47,10 +67,30 @@ void FGMASBoundQueueV2::ClearStaleOperationData()
 			if (!OperationPayloads.Contains(OperationID))
 			{
 				UE_LOG(LogGMCAbilitySystem, Warning, TEXT("OperationID %d not found in OperationPayloads, but still in cache expiration map"), OperationID);
+				It.RemoveCurrent();
 				continue;
 			}
 			// Remove stale operation data
 			OperationPayloads.Remove(OperationID);
+			It.RemoveCurrent();
+		}
+	}
+}
+
+void FGMASBoundQueueV2::ClearStaleProcessedOperations()
+{
+	if (!GMCMovementComponent) return;
+
+	// Match the saved-move horizon and double it for slack — a marker has to outlive
+	// any tick window during which the same OperationID could legitimately re-arrive
+	// (client replay, server SV_GetLastClientData re-read), and stale entries can
+	// never wrongly admit a re-process because OperationIDs are unique-monotonic per
+	// direction (positive = server, negative = client).
+	const int64 Cutoff = ProcessedOpTickCounter - (GMCMovementComponent->MoveHistoryMaxSize * 2);
+	for (auto It = ProcessedOperations.CreateIterator(); It; ++It)
+	{
+		if (It.Value() < Cutoff)
+		{
 			It.RemoveCurrent();
 		}
 	}
@@ -82,9 +122,9 @@ void FGMASBoundQueueV2::GenPreLocalMoveExecution()
 		return;
 	}
 
-	if (ClientQueuedOperations.Num() > 0)
+	int OperationIDToProcess = 0;
+	while (PopFirstOperationID(ClientQueuedOperations, OperationIDToProcess))
 	{
-		const int OperationIDToProcess = ClientQueuedOperations.Pop();
 		if (OperationPayloads.Contains(OperationIDToProcess))
 		{
 			// Replicate the full derived payload (e.g. FGMASBoundQueueV2AbilityActivationOperation
@@ -92,6 +132,17 @@ void FGMASBoundQueueV2::GenPreLocalMoveExecution()
 			// on the receiving end. Sending only the base struct (just OperationID) causes
 			// IsValidClientOperation to return false and the ability is never run server-side.
 			OperationData = OperationPayloads[OperationIDToProcess];
+			return;
+		}
+	}
+
+	int AckOperationID = 0;
+	while (PopFirstOperationID(PendingAckOperations, AckOperationID))
+	{
+		if (AckOperationID != 0)
+		{
+			OperationData = FInstancedStruct::Make<FGMASBoundQueueV2AcknowledgeOperation>(
+				FGMASBoundQueueV2AcknowledgeOperation{AckOperationID});
 			return;
 		}
 	}
@@ -129,12 +180,17 @@ void FGMASBoundQueueV2::GenAncillaryTick(const float DeltaTime)
 {
 	CheckValidState();
 
+	// Independent of GMCMoveCounter — ProcessedOperations expiration must run on every
+	// role (server, listen-server host, standalone), not just remote clients.
+	ProcessedOpTickCounter++;
+	ClearStaleProcessedOperations();
+
 	if (GMCMovementComponent->GetNetMode() >= NM_Client)
 	{
 		GMCMoveCounter++;
 		ClearStaleOperationData();
 	}
-	
+
 	// Tick all Server Queued Operations
 	for (auto It = ServerQueuedBoundOperationsGracePeriods.CreateIterator(); It; ++It)
 	{
@@ -145,7 +201,7 @@ void FGMASBoundQueueV2::GenAncillaryTick(const float DeltaTime)
 			if (OperationPayloads.Contains(It.Key()))
 			{
 				OnServerOperationForced.Broadcast(OperationPayloads[It.Key()]);
-				OperationPayloads.Remove(It.Key());
+				RemovePayloadByID(It.Key());
 			}
 			It.RemoveCurrent();
 		}
@@ -154,6 +210,10 @@ void FGMASBoundQueueV2::GenAncillaryTick(const float DeltaTime)
 
 void FGMASBoundQueueV2::CacheOperationPayload(const int OperationID, const FInstancedStruct& Payload)
 {
+	OperationDataCacheExpiration.RemoveAll([OperationID](const FOperationDataCacheExpiration& Expiration)
+	{
+		return Expiration.OperationID == OperationID;
+	});
 	OperationPayloads.Add(OperationID, Payload);
 	OperationDataCacheExpiration.Add({OperationID, GMCMoveCounter});
 }
@@ -161,6 +221,42 @@ void FGMASBoundQueueV2::CacheOperationPayload(const int OperationID, const FInst
 void FGMASBoundQueueV2::QueueClientOperation(const int OperationID)
 {
 	ClientQueuedOperations.Add(OperationID);
+}
+
+void FGMASBoundQueueV2::QueueServerMirrorOperation(const int OperationID)
+{
+	if (OperationID == 0 || ServerMirrorQueuedOperations.Contains(OperationID))
+	{
+		return;
+	}
+
+	ServerMirrorQueuedOperations.Add(OperationID);
+}
+
+bool FGMASBoundQueueV2::PopNextServerMirrorOperation(FInstancedStruct& OutOperation)
+{
+	int OperationID = 0;
+	while (PopFirstOperationID(ServerMirrorQueuedOperations, OperationID))
+	{
+		if (OperationPayloads.Contains(OperationID))
+		{
+			OutOperation = OperationPayloads[OperationID];
+			return true;
+		}
+	}
+
+	OutOperation = FInstancedStruct();
+	return false;
+}
+
+void FGMASBoundQueueV2::QueueAcknowledgement(const int OperationID)
+{
+	if (OperationID <= 0 || PendingAckOperations.Contains(OperationID))
+	{
+		return;
+	}
+
+	PendingAckOperations.Add(OperationID);
 }
 
 void FGMASBoundQueueV2::QueueServerOperation(const int OperationID, const float Timeout)
@@ -182,10 +278,7 @@ void FGMASBoundQueueV2::QueueServerOperation(const int OperationID, const float 
 
 void FGMASBoundQueueV2::ServerAcknowledgeOperation(int ID)
 {
-	if (OperationPayloads.Contains(ID))
-	{
-		OperationPayloads.Remove(ID);
-	}
+	RemovePayloadByID(ID);
 	
 	if (ServerQueuedBoundOperationsGracePeriods.Contains(ID))
 	{
@@ -199,7 +292,11 @@ void FGMASBoundQueueV2::CheckValidState() const
 	if (GMCMovementComponent->GetNetMode() < NM_Client)
 	{
 		// Check Client Queued Operations is empty
-		if (ClientQueuedOperations.Num() > 0)
+		const bool bLocalAuthorityCanQueue =
+			GMCMovementComponent->GetNetMode() == NM_Standalone ||
+			GMCMovementComponent->IsLocallyControlledListenServerPawn() ||
+			GMCMovementComponent->IsLocallyControlledDedicatedServerPawn();
+		if (!bLocalAuthorityCanQueue && ClientQueuedOperations.Num() > 0)
 		{
 			UE_LOG(LogGMCAbilitySystem, Error, TEXT("ClientQueuedOperations has %d pending operations on server"), ClientQueuedOperations.Num());
 		}

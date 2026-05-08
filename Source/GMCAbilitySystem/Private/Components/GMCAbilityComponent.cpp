@@ -544,20 +544,83 @@ void UGMC_AbilitySystemComponent::QueueAbility(FGameplayTag InputTag, const UInp
 {
 	if (GetOwnerRole() != ROLE_AutonomousProxy && GetOwnerRole() != ROLE_Authority) return;
 
+	const TArray<TSubclassOf<UGMCAbility>> Granted = GetGrantedAbilitiesByTag(InputTag);
+
+	// Coalesce by semantic input. If any granted ability for this InputTag rejects
+	// multi-instance, drop a duplicate queue request whose payload is "activate this
+	// same InputTag again" — both for ops already in ClientQueuedOperations (waiting
+	// for the next movement tick) and for the bound OperationData slot (set for the
+	// next outbound move). Without this, BP wiring that polls input each tick or
+	// responds to ETriggerEvent::Triggered (fires every tick the key is held) was
+	// queueing N redundant activation ops per held key, each with its own OpID.
+	// Each crossed the wire, the server activated the first and rejected the rest,
+	// and during high latency the rejected activations contributed to the
+	// "re-apply for a moment" visual.
+	bool bRequireSingleInstance = !Granted.IsEmpty();
+	for (const TSubclassOf<UGMCAbility>& AbilityClass : Granted)
+	{
+		if (!AbilityClass) { bRequireSingleInstance = false; break; }
+		const UGMCAbility* CDO = AbilityClass->GetDefaultObject<UGMCAbility>();
+		if (!CDO || CDO->bAllowMultipleInstances)
+		{
+			bRequireSingleInstance = false;
+			break;
+		}
+	}
+
+	if (bRequireSingleInstance)
+	{
+		auto IsSameInputActivation = [&](const FInstancedStruct& Payload) -> bool
+		{
+			if (Payload.GetScriptStruct() != FGMASBoundQueueV2AbilityActivationOperation::StaticStruct())
+			{
+				return false;
+			}
+			const FGMASBoundQueueV2AbilityActivationOperation& Existing =
+				Payload.Get<FGMASBoundQueueV2AbilityActivationOperation>();
+			return Existing.InputTag == InputTag;
+		};
+
+		for (const int QueuedID : BoundQueueV2.ClientQueuedOperations)
+		{
+			if (BoundQueueV2.HasPayloadByID(QueuedID) &&
+				IsSameInputActivation(BoundQueueV2.GetPayloadByID(QueuedID)))
+			{
+				return;
+			}
+		}
+
+		if (IsSameInputActivation(BoundQueueV2.OperationData))
+		{
+			return;
+		}
+	}
+
+	// Caller-opt-in: skip the wire round-trip if any granted ability already has an
+	// active instance. Server-side TryActivate also rejects when
+	// bAllowMultipleInstances=false, but pre-filtering locally avoids burning a bound
+	// OperationData slot on a doomed activation that the server will just refuse.
+	if (bPreventConcurrentActivation)
+	{
+		for (const TSubclassOf<UGMCAbility>& AbilityClass : Granted)
+		{
+			if (AbilityClass && GetActiveAbilityCount(AbilityClass) > 0)
+			{
+				return;
+			}
+		}
+	}
+
 	FGMASBoundQueueV2AbilityActivationOperation ActivationData;
 	ActivationData.InputTag = InputTag;
 	ActivationData.InputAction = InputAction;
 	const int OperationID = BoundQueueV2.MakeOperationData<FGMASBoundQueueV2AbilityActivationOperation>(ActivationData);
 
-	if (!HasAuthority())
-	{
-		BoundQueueV2.QueueClientOperation(OperationID);
-	}
-	else
-	{
-		BoundQueueV2.QueueServerOperation(OperationID);
-	}
-	
+	// Ability activation is a local/client-auth request stream, even for standalone
+	// and listen-server host pawns. Server-auth mirror ops are only for state the
+	// server already applied and needs clients to mirror.
+	BoundQueueV2.QueueClientOperation(OperationID);
+
 }
 
 int32 UGMC_AbilitySystemComponent::GetQueuedAbilityCount(FGameplayTag AbilityTag)
@@ -601,7 +664,9 @@ int UGMC_AbilitySystemComponent::EndAbilitiesByTag(FGameplayTag AbilityTag) {
 	int AbilitiesEnded = 0;
 	for (const auto& ActiveAbilityData : ActiveAbilities)
 	{
-		if (ActiveAbilityData.Value->AbilityTag.MatchesTag(AbilityTag))
+		if (ActiveAbilityData.Value &&
+			ActiveAbilityData.Value->AbilityState != EAbilityState::Ended &&
+			ActiveAbilityData.Value->AbilityTag.MatchesTag(AbilityTag))
 		{
 			ActiveAbilityData.Value->EndAbility();
 			AbilitiesEnded++;
@@ -615,7 +680,9 @@ int UGMC_AbilitySystemComponent::EndAbilitiesByClass(TSubclassOf<UGMCAbility> Ab
 	int AbilitiesEnded = 0;
 	for (const auto& ActiveAbilityData : ActiveAbilities)
 	{
-		if (ActiveAbilityData.Value->IsA(AbilityClass))
+		if (ActiveAbilityData.Value &&
+			ActiveAbilityData.Value->AbilityState != EAbilityState::Ended &&
+			ActiveAbilityData.Value->IsA(AbilityClass))
 		{
 			ActiveAbilityData.Value->EndAbility();
 			AbilitiesEnded++;
@@ -633,7 +700,8 @@ int UGMC_AbilitySystemComponent::EndAbilitiesByQuery(const FGameplayTagQuery& Qu
 	{
 		if (UGMCAbility* Ability = ActiveAbilityData.Value)
 		{
-			if (Query.Matches(Ability->AbilityDefinition))
+			if (Ability->AbilityState != EAbilityState::Ended &&
+				Query.Matches(Ability->AbilityDefinition))
 			{
 				Ability->SetPendingEnd();
 				AbilitiesEnded++;
@@ -748,6 +816,10 @@ void UGMC_AbilitySystemComponent::GenPredictionTick(float DeltaTime)
 
 	// Drain any PredictedQueued operations buffered since the last tick.
 	DrainPendingPredictedOperations();
+	if (!HasAuthority())
+	{
+		DrainServerMirrorOperations();
+	}
 
 	// SV_IsExecutingRemoteMoves() is GMC's gate for "we're currently processing a
 	// remote client's move" — the only window in which SV_GetLastClientData() is
@@ -858,6 +930,20 @@ void UGMC_AbilitySystemComponent::DrainPendingPredictedOperations()
 	}
 }
 
+void UGMC_AbilitySystemComponent::DrainServerMirrorOperations()
+{
+	FInstancedStruct Operation;
+	while (BoundQueueV2.PopNextServerMirrorOperation(Operation))
+	{
+		if (!Operation.IsValid())
+		{
+			continue;
+		}
+
+		ProcessOperation(Operation, true);
+	}
+}
+
 void UGMC_AbilitySystemComponent::PreLocalMoveExecution()
 {
 	if (QueuedTaskData.Num() > 0)
@@ -871,7 +957,7 @@ void UGMC_AbilitySystemComponent::RPCOnServerOperationAdded_Implementation(const
 {
 	UE_LOG(LogTemp, Warning, TEXT("RPCOnServerOperationAdded: %d"), OperationID);
 	BoundQueueV2.CacheOperationPayload(OperationID, Operation);
-	BoundQueueV2.ClientQueuedOperations.Add(OperationID);
+	BoundQueueV2.QueueServerMirrorOperation(OperationID);
 }
 
 void UGMC_AbilitySystemComponent::BoundQueueV2Debug(TSubclassOf<UGMCAbilityEffect> Effect)
@@ -888,8 +974,28 @@ void UGMC_AbilitySystemComponent::BoundQueueV2Debug(TSubclassOf<UGMCAbilityEffec
 
 void UGMC_AbilitySystemComponent::OnServerOperationForced(FInstancedStruct OperationData)
 {
-	UE_LOG(LogTemp, Warning, TEXT("Forcing Operation On Server"));
-	ProcessOperation(OperationData, false, true);
+	// Server-authoritative state has already been applied at queue time (the immediate
+	// path inside ApplyAbilityEffect / RemoveEffectByIdSafe / AddImpulse /
+	// SetActorLocation). The grace period firing only means the client never sent
+	// back its acknowledgement on the GMC bound channel within the timeout — typically
+	// because of latency, packet loss, or the client just having very little to say
+	// for that move window.
+	//
+	// Re-running ProcessOperation on the server here is a footgun: it would re-apply
+	// the effect / impulse / teleport, AFTER the originating ability may have ended.
+	// That is precisely the source of the user-visible "server re-applies for a
+	// moment" bug — a server-auth ApplyEffect timing out, force-firing, and re-adding
+	// GrantedTags briefly while the ability is already in the Ended state.
+	//
+	// The Client+Reliable RPC fired by `OnServerOperationAdded` at queue time is
+	// guaranteed to deliver eventually; if it didn't, the connection is severed and
+	// no amount of retransmission helps. So this branch is intentionally a no-op
+	// beyond a verbose log.
+	const FGMASBoundQueueV2OperationBaseData* BD = OperationData.GetPtr<FGMASBoundQueueV2OperationBaseData>();
+	const int OpID = BD ? BD->OperationID : 0;
+	UE_LOG(LogGMCAbilitySystem, Verbose,
+		TEXT("[ServerOpForceTimeout] op=%d struct=%s — client never confirmed mirror; server state already applied, no retry"),
+		OpID, OperationData.GetScriptStruct() ? *OperationData.GetScriptStruct()->GetName() : TEXT("null"));
 }
 
 void UGMC_AbilitySystemComponent::BeginPlay()
@@ -1710,6 +1816,45 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 
 	const UScriptStruct* StructType = PayloadData.GetScriptStruct();
 
+	// Idempotency for ability activation: if this OperationID has already been
+	// dispatched to TryActivateAbilitiesByInputTag once, drop every subsequent
+	// re-encounter until the marker ages out. Two paths re-feed the same ID into
+	// ProcessOperation:
+	//   - Client replay loop: CL_OnRepAPMove → CL_ReplayMoves → ExecuteMove re-runs
+	//     GenPredictionTick on the same move, calling ProcessOperation again with
+	//     the same payload that activated the ability the first time round.
+	//   - Server: SV_GetLastClientData() returns the same OutputState across
+	//     consecutive ticks when the next remote move hasn't arrived yet (high
+	//     latency / packet loss), so ServerProcessOperation re-caches and
+	//     re-dispatches the same client-supplied activation op.
+	// Without this gate, a rapid press-then-release pattern reactivates the ability
+	// on the server's authoritative state immediately after CleanupStaleAbilities
+	// reaped the previously-Ended instance — the local client then sees a brief
+	// replicated re-apply before the trailing release state ends it again.
+	// Effect / Impulse / Location ops carry their own idempotency via
+	// ProcessEffectApplicationFromOperation's ActiveEffects.Contains check etc., so
+	// the gate is intentionally scoped to ability activation.
+	if (StructType == FGMASBoundQueueV2AbilityActivationOperation::StaticStruct() &&
+		BoundQueueV2.IsOperationProcessed(OperationID))
+	{
+		if (GMASApplyTrace::CVarLogApplyTrace.GetValueOnGameThread())
+		{
+			UE_LOG(LogGMCAbilitySystem, Warning,
+				TEXT("[ProcessOpDuplicate] op=%d auth=%d fromMove=%d — already processed, dropping"),
+				OperationID, HasAuthority() ? 1 : 0, bFromMovementTick ? 1 : 0);
+		}
+		// Clear the cache slot on the server so a same-OutputState re-read doesn't keep
+		// re-caching the duplicate payload. ServerProcessOperation re-caches via the
+		// `!HasPayloadByID` gate; without this drop, the entry parks in OperationPayloads
+		// forever (server's ClearStaleOperationData is gated on NM_Client). The marker
+		// in ProcessedOperations remains the source of truth for "already done".
+		if (HasAuthority())
+		{
+			BoundQueueV2.RemovePayloadByID(OperationID);
+		}
+		return false;
+	}
+
 	// Defer only when the ability wants the ancillary tick but we're currently on
 	// the movement (prediction) tick. The matching ancillary tick is yet to come
 	// in this engine tick — preserving the cache lets it activate there. Without
@@ -1724,6 +1869,10 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 	// the server, avoiding cache leak on `OperationPayloads` /
 	// `OperationDataCacheExpiration` from the server's per-move ancillary tick
 	// re-caching the op via ServerProcessOperation.
+	//
+	// Critical: the deferral path must NOT mark the op as processed — we want the
+	// matching ancillary tick to actually run TryActivate. Marking happens only at
+	// the dispatch site below.
 	if (!bForce && StructType == FGMASBoundQueueV2AbilityActivationOperation::StaticStruct())
 	{
 		const FGMASBoundQueueV2AbilityActivationOperation& AbActivation =
@@ -1770,7 +1919,21 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 				HasAuthority() ? 1 : 0, bFromMovementTick ? 1 : 0, bForce ? 1 : 0);
 		}
 
-		return TryActivateAbilitiesByInputTag(Data.InputTag, Data.InputAction, bFromMovementTick, bForce);
+		// Mark before dispatch so the op is consumed exactly once even if
+		// TryActivate's downstream calls (cancel-conflicting, block-other, chain
+		// hooks) re-enter ProcessOperation for unrelated ops on the same tick.
+		// Marking is unconditional: cooldown / blocked-by / pre-check failures
+		// still consume the op once — the alternative would re-process the same
+		// rejected activation on every replay tick, multiplying the rejection log.
+		BoundQueueV2.MarkOperationProcessed(OperationID);
+
+		const bool bActivated = TryActivateAbilitiesByInputTag(Data.InputTag, Data.InputAction, bFromMovementTick, bForce);
+		if (!HasAuthority() && OperationID > 0)
+		{
+			BoundQueueV2.QueueAcknowledgement(OperationID);
+			BoundQueueV2.RemovePayloadByID(OperationID);
+		}
+		return bActivated;
 	}
 
 	// Everything below happens only during the Prediction tick
@@ -1806,8 +1969,8 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 		ProcessEffectApplicationFromOperation(Data);
 		if (!HasAuthority())
 		{
-			// Make an operation to confirm the effect application
-			BoundQueueV2.OperationData  = FInstancedStruct::Make<FGMASBoundQueueV2AcknowledgeOperation>(FGMASBoundQueueV2AcknowledgeOperation{OperationID});
+			BoundQueueV2.QueueAcknowledgement(OperationID);
+			BoundQueueV2.RemovePayloadByID(OperationID);
 		}
 		return true;
 	}
@@ -1820,8 +1983,8 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 		
 		if (!HasAuthority())
 		{
-			// Make an operation to confirm the effect application
-			BoundQueueV2.OperationData  = FInstancedStruct::Make<FGMASBoundQueueV2AcknowledgeOperation>(FGMASBoundQueueV2AcknowledgeOperation{OperationID});
+			BoundQueueV2.QueueAcknowledgement(OperationID);
+			BoundQueueV2.RemovePayloadByID(OperationID);
 		}
 		
 		return true;
@@ -1834,8 +1997,8 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 		GMCMovementComponent->AddImpulse(KBData.Impulse, KBData.bVelocityChange);
 		if (!HasAuthority())
 		{
-			// Make an operation to confirm the impulse application
-			BoundQueueV2.OperationData = FInstancedStruct::Make<FGMASBoundQueueV2AcknowledgeOperation>(FGMASBoundQueueV2AcknowledgeOperation{OperationID});
+			BoundQueueV2.QueueAcknowledgement(OperationID);
+			BoundQueueV2.RemovePayloadByID(OperationID);
 		}
 		return true;
 	}
@@ -1847,8 +2010,8 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 		GetOwner()->SetActorLocation(LocationData.Location);
 		if (!HasAuthority())
 		{
-			// Make an operation to confirm the location change
-			BoundQueueV2.OperationData = FInstancedStruct::Make<FGMASBoundQueueV2AcknowledgeOperation>(FGMASBoundQueueV2AcknowledgeOperation{OperationID});
+			BoundQueueV2.QueueAcknowledgement(OperationID);
+			BoundQueueV2.RemovePayloadByID(OperationID);
 		}
 		return true;
 	}
@@ -1986,21 +2149,24 @@ void UGMC_AbilitySystemComponent::ServerProcessOperation(const FInstancedStruct&
 
 void UGMC_AbilitySystemComponent::ServerProcessAcknowledgedOperation(int OperationID, bool bFromMovementTick)
 {
-	// Everything else should be server built operations that the client has confirmed
-	// Ie, applied server-auth effects or server-auth events
+	// ACK is a *confirmation* that the client mirrored the server-authoritative state
+	// change — nothing more. The server already applied at queue time
+	// (ApplyAbilityEffect/RemoveEffectByIdSafe/AddImpulse/SetActorLocation ServerAuth
+	// paths). Re-running ProcessOperation here would re-apply the effect, and worse:
+	// if the server has already removed the effect in the interim (rapid
+	// activate/deactivate, ability-ended path), ProcessEffectApplicationFromOperation's
+	// `ActiveEffects.Contains` early-exit no longer triggers, so the ACK arrives and
+	// re-creates a ghost copy of the effect — exactly the "server re-applies for a
+	// moment" symptom the user observed.
+	//
+	// Just clean up the pending mirror slot.
 
 	if (!BoundQueueV2.HasPayloadByID(OperationID) || !BoundQueueV2.ServerQueuedBoundOperationsGracePeriods.Contains(OperationID))
 	{
 		return;
 	}
-	
 
-	FInstancedStruct PayloadData = BoundQueueV2.GetPayloadByID(OperationID);
-	
-	if (ProcessOperation(PayloadData, bFromMovementTick))
-	{
-		BoundQueueV2.ServerAcknowledgeOperation(OperationID);
-	}
+	BoundQueueV2.ServerAcknowledgeOperation(OperationID);
 }
 
 
@@ -2011,7 +2177,13 @@ void UGMC_AbilitySystemComponent::AddImpulse(FVector Impulse, bool bVelChange)
 		UE_LOG(LogGMCAbilitySystem, Warning, TEXT("Client attempted to apply server-auth event"));
 		return;
 	}
-	//
+
+	// Apply on server immediately — same contract as the ApplyEffect ServerAuth path
+	// above. Otherwise an impulse queued near the tail of an ability's lifetime could
+	// fire via the timeout/force path long after the ability ended, mid-air-launching
+	// the pawn at the wrong moment.
+	GMCMovementComponent->AddImpulse(Impulse, bVelChange);
+
 	FGMASBoundQueueV2AddImpulseOperation ImpulseOperation;
 	ImpulseOperation.Impulse = Impulse;
 	ImpulseOperation.bVelocityChange = bVelChange;
@@ -2026,10 +2198,13 @@ void UGMC_AbilitySystemComponent::SetActorLocation(FVector Location)
 		UE_LOG(LogGMCAbilitySystem, Warning, TEXT("Client attempted to apply server-auth event"));
 		return;
 	}
-	
-	FGMASBoundQueueV2SetActorLocationOperation ImpulseOperation;
-	ImpulseOperation.Location = Location;
-	const int OperationID = BoundQueueV2.MakeOperationData<FGMASBoundQueueV2SetActorLocationOperation>(ImpulseOperation);
+
+	// Apply on server immediately — see AddImpulse rationale.
+	GetOwner()->SetActorLocation(Location);
+
+	FGMASBoundQueueV2SetActorLocationOperation LocationOperation;
+	LocationOperation.Location = Location;
+	const int OperationID = BoundQueueV2.MakeOperationData<FGMASBoundQueueV2SetActorLocationOperation>(LocationOperation);
 	BoundQueueV2.QueueServerOperation(OperationID);
 }
 
@@ -2240,17 +2415,42 @@ bool UGMC_AbilitySystemComponent::ApplyAbilityEffect(TSubclassOf<UGMCAbilityEffe
 				return false;
 			}
 
-		
+			const int EffectID = GetNextAvailableEffectID();
+			ReservedEffectIDs.Add(EffectID);
+			OutEffectId = EffectID;
+			OutEffectHandle = OutEffectId;
+
+			// Apply on the server IMMEDIATELY. The previous design queued the op for a
+			// client-mirror RPC plus a 1-second grace period and only mutated server state
+			// when the client ACK arrived (or — under latency / packet loss — when the
+			// grace period timed out and OnServerOperationForced fired). Under the
+			// timeout-fired path the effect was applied to the server *after* the
+			// originating ability had already ended, briefly re-adding GrantedTags and
+			// producing the visible "server re-applies for a moment before re-disabling"
+			// bug. Server authority must never depend on client ACK timing — the server
+			// applies once at queue time; the queued op now carries only the
+			// client-mirror RPC payload. ACK simply confirms the client mirrored it.
+			UGMCAbilityEffect* Effect = DuplicateObject(EffectClass->GetDefaultObject<UGMCAbilityEffect>(), this);
+			FGMCAbilityEffectData InitData = InitializationData.IsValid()
+				? InitializationData
+				: EffectClass->GetDefaultObject<UGMCAbilityEffect>()->EffectData;
+			InitData.EffectID = EffectID;
+			OutEffect = ApplyAbilityEffect(Effect, InitData);
+			if (!OutEffect)
+			{
+				ReservedEffectIDs.Remove(EffectID);
+				return false;
+			}
+
+			// Queue the client-mirror operation. Carries the same EffectID so the client's
+			// ProcessEffectApplicationFromOperation idempotency (ActiveEffects.Contains)
+			// matches if the client's own predict path already applied. Force-path firing
+			// will be a no-op on the server (already applied).
 			FGMASBoundQueueV2ApplyEffectOperation EffectActivationData;
 			EffectActivationData.EffectClass = EffectClass;
 			EffectActivationData.EffectData = InitializationData;
-			EffectActivationData.EffectID = GetNextAvailableEffectID();
-			ReservedEffectIDs.Add(EffectActivationData.EffectID);
-
-			// We return back the Operation ID instead of the Effect ID which isn't great
-			OutEffectId =EffectActivationData.EffectID;
-			int OperationID = BoundQueueV2.MakeOperationData<FGMASBoundQueueV2ApplyEffectOperation>(EffectActivationData);
-			OutEffectHandle = OutEffectId;
+			EffectActivationData.EffectID = EffectID;
+			const int OperationID = BoundQueueV2.MakeOperationData<FGMASBoundQueueV2ApplyEffectOperation>(EffectActivationData);
 			BoundQueueV2.QueueServerOperation(OperationID);
 			return true;
 		}
@@ -2663,7 +2863,22 @@ bool UGMC_AbilitySystemComponent::RemoveEffectByIdSafe(TArray<int> Ids, EGMCAbil
 				{
 					return false;
 				}
-				
+
+				// Symmetric to the Apply path: remove immediately on the server, then
+				// queue the client-mirror op for the RPC. The previous design routed
+				// authoritative removal through the same delayed ACK / force path, so a
+				// server-auth removal queued near the end of an ability's lifetime could
+				// race with another late-applied effect and leave server state out of
+				// step with the wire. Mutating server state here keeps the authoritative
+				// timeline tight.
+				for (const int Id : Ids)
+				{
+					if (ActiveEffects.Contains(Id))
+					{
+						RemoveActiveAbilityEffect(ActiveEffects[Id]);
+					}
+				}
+
 				FGMASBoundQueueV2RemoveEffectOperation EffectRemovalData;
 				EffectRemovalData.EffectIDs = Ids;
 				const int OperationID = BoundQueueV2.MakeOperationData<FGMASBoundQueueV2RemoveEffectOperation>(EffectRemovalData);

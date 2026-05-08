@@ -837,6 +837,9 @@ private:
 	// GenPredictionTick and GenAncillaryTick.
 	void DrainPendingPredictedOperations();
 
+	// Drains server-auth mirror operations received by reliable RPC on the owning client.
+	void DrainServerMirrorOperations();
+
 	// Events
 	virtual bool ProcessOperation(FInstancedStruct OperationData, bool bFromMovementTick = true, bool bForce = false);
 	virtual void ProcessEffectApplicationFromOperation(const FGMASBoundQueueV2ApplyEffectOperation& Data);
