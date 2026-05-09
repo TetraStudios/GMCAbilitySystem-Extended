@@ -702,6 +702,11 @@ public:
 	UPROPERTY(BlueprintAssignable)
 	FOnEffectApplied OnEffectApplied;
 
+	// Fires only the first time a given effect instance is successfully applied (passes tag/query gates).
+	// Subsequent re-runs of StartEffect on the same instance (e.g. via repeat InitializeEffect) will NOT re-fire this.
+	UPROPERTY(BlueprintAssignable)
+	FOnEffectApplied OnInitialEffectApplied;
+
 	UPROPERTY(BlueprintAssignable)
 	FOnEffectRemoved OnEffectRemoved;
 

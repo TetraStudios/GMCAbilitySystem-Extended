@@ -96,9 +96,15 @@ void UGMCAbilityEffect::StartEffect()
 
 	EndActiveAbilitiesByDefinitionQuery(EffectData.EndAbilityOnActivationQuery);
 
+	const bool bWasFirstApply = !bHasAppliedEffect;
 	bHasAppliedEffect = true;
 
 	OwnerAbilityComponent->OnEffectApplied.Broadcast(this);
+
+	if (bWasFirstApply)
+	{
+		OwnerAbilityComponent->OnInitialEffectApplied.Broadcast(this);
+	}
 
 	// Instant effects modify base value and end instantly
 	if (EffectData.EffectType == EGMASEffectType::Instant
