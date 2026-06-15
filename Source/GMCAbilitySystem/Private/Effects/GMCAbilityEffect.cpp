@@ -29,16 +29,26 @@ FGMCAbilityEffectData UGMCAbilityEffect::GetDefaultEffectData(TSubclassOf<UGMCAb
 
 void UGMCAbilityEffect::InitializeEffect(FGMCAbilityEffectData InitializationData)
 {
-	EffectData = InitializationData;
-	
-	OwnerAbilityComponent = EffectData.OwnerAbilityComponent;
-	
-	if (OwnerAbilityComponent == nullptr)
+	// Validate the incoming owner BEFORE mutating any state. InitializeEffect is
+	// BlueprintCallable and is legitimately re-run on an already-active instance
+	// (see the OnInitialEffectApplied note in StartEffect — "repeat InitializeEffect").
+	// If we overwrote EffectData and OwnerAbilityComponent first and only then checked,
+	// a call carrying no owner (e.g. a default-constructed FGMCAbilityEffectData) would
+	// null the owner of a live effect that is still registered in ActiveEffects. The
+	// next TickActiveEffects -> Tick() would then dereference that null owner
+	// (EffectData.CurrentDuration = OwnerAbilityComponent->ActionTimer - ...) and crash
+	// with EXCEPTION_ACCESS_VIOLATION. Treat a no-owner init as a no-op so existing
+	// state (owner, EffectID, timers) is preserved untouched.
+	if (InitializationData.OwnerAbilityComponent == nullptr)
 	{
-		UE_LOG(LogGMCAbilitySystem, Error, TEXT("OwnerAbilityComponent is null in UGMCAbilityEffect::InitializeEffect"));
+		UE_LOG(LogGMCAbilitySystem, Error, TEXT("OwnerAbilityComponent is null in UGMCAbilityEffect::InitializeEffect; ignoring init to preserve existing state."));
 		return;
 	}
-	
+
+	EffectData = InitializationData;
+
+	OwnerAbilityComponent = EffectData.OwnerAbilityComponent;
+
 	ClientEffectApplicationTime = OwnerAbilityComponent->ActionTimer;
 
 	// If server sends times, use those
@@ -155,6 +165,21 @@ void UGMCAbilityEffect::EndEffect()
 
 	// Only remove tags and abilities if the effect has started and applied
 	if (!bHasStarted || !bHasAppliedEffect) return;
+
+	// Defense in depth: everything below operates on the owner (temporal-modifier rollback,
+	// tag/ability removal, OnEffectRemoved broadcast, chain hooks). A started+applied effect
+	// should always retain its owner — the InitializeEffect guard above ensures a no-owner
+	// re-init can't null a live effect — but EndEffect is also reached from non-Tick removal
+	// paths (RemoveActiveAbilityEffect during TickActiveEffects cleanup, RemoveEffectBy*Safe,
+	// gameplay code). If the owner is gone there is nothing to clean up on it; bail rather than
+	// dereference null (lines below were previously unguarded; the chain-hook block at the end
+	// already null-checked the owner, so this makes the whole function consistent).
+	if (OwnerAbilityComponent == nullptr)
+	{
+		UE_LOG(LogGMCAbilitySystem, Error, TEXT("UGMCAbilityEffect::EndEffect on %s with null OwnerAbilityComponent; skipping owner-dependent cleanup."), *GetNameSafe(this));
+		return;
+	}
+
 		// If the effect is not an instant effect, we need to negate the modifiers
 	if (IsEffectModifiersRegisterInHistory())
 	{
@@ -235,6 +260,19 @@ void UGMCAbilityEffect::BeginDestroy() {
 
 void UGMCAbilityEffect::Tick(float DeltaTime)
 {
+	// Defense in depth: effectively every branch below dereferences OwnerAbilityComponent
+	// (CurrentDuration update, the per-EffectType modifier loops, tag/query maintenance).
+	// A registered active effect must never be ownerless, but if any path leaves us without
+	// an owner, reap the effect via bCompleted (TickActiveEffects removes completed effects)
+	// instead of dereferencing null and crashing. Do NOT call EndEffect() here — it also
+	// dereferences OwnerAbilityComponent (modifier rollback, OnEffectRemoved broadcast).
+	if (OwnerAbilityComponent == nullptr)
+	{
+		UE_LOG(LogGMCAbilitySystem, Error, TEXT("UGMCAbilityEffect::Tick on %s with null OwnerAbilityComponent; completing effect to remove it safely."), *GetNameSafe(this));
+		bCompleted = true;
+		return;
+	}
+
 	// Consume the bilateral predicted-end defer. Uses an absolute ActionTimer timestamp instead of a
 	// per-tick countdown — both client and server compute the same EndAtActionTimer (same move log,
 	// same ActionTimer at Remove + same ClientGraceTime), and the comparison below fires on the
