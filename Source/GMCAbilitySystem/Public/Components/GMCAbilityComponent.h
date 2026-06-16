@@ -379,8 +379,12 @@ public:
 
 	// Do not call this directly unless you know what you are doing; go through the RemoveActiveAbilityEffectSafe if
 	// doing this from outside of the component, to allow queuing and sanity-check.
+	// bAllowAntiDriftDefer: pass true ONLY from predicted in-move remove paths. When true and the effect is a
+	// networked Ticking/Periodic effect with ClientGraceTime > 0, the end is deferred to an absolute ActionTimer
+	// so client and server stop ticking it on the same logical move tick (prevents high-FPS removal-window drift).
+	// Server-authoritative / cleanup removals must use the default (false) and end immediately.
 	UFUNCTION(BlueprintCallable, Category="GMAS|Effects")
-	void RemoveActiveAbilityEffect(UGMCAbilityEffect* Effect);
+	void RemoveActiveAbilityEffect(UGMCAbilityEffect* Effect, bool bAllowAntiDriftDefer = false);
 
 	UFUNCTION(BlueprintCallable, Category="GMAS|Effects")
 	void RemoveActiveAbilityEffectByHandle(int EffectHandle, EGMCAbilityEffectQueueType QueueType = EGMCAbilityEffectQueueType::Predicted);
@@ -719,8 +723,17 @@ private:
 	UPROPERTY()
 	TMap<int, UGMCAbility*> ActiveAbilities;
 	
+	// Active cooldowns keyed by ability tag. Value is the absolute expiry
+	// time in ActionTimer units (i.e. the ActionTimer value at which the
+	// cooldown ends). Storing expiry-time rather than remaining-duration is
+	// required to be drift-free under GMC client prediction: combined client
+	// moves cause AncillaryTick to fire multiple times per real frame on the
+	// same predicted move, and a remaining-duration model accumulates extra
+	// decrements (observed 2-2.6x faster than wall clock on a laggy/high-FPS
+	// client, draining a 5s cooldown in ~2s). Expiry-time is set once and only
+	// compared, so repeated tick fires are harmless.
 	UPROPERTY()
-	TMap<FGameplayTag, float> ActiveCooldowns;
+	TMap<FGameplayTag, double> ActiveCooldowns;
 
 	int GenerateAbilityID() const {return ActionTimer * 100;}
 	

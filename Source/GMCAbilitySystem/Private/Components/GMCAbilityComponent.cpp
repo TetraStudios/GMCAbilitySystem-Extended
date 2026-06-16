@@ -497,20 +497,33 @@ void UGMC_AbilitySystemComponent::QueueTaskData(const FInstancedStruct& InTaskDa
 void UGMC_AbilitySystemComponent::SetCooldownForAbility(const FGameplayTag AbilityTag, float CooldownTime)
 {
 	if (AbilityTag == FGameplayTag::EmptyTag) return;
-	
-	if (ActiveCooldowns.Contains(AbilityTag))
+
+	// Cooldowns are stored as an absolute expiry in ActionTimer units, so they
+	// require a valid (non-zero, initialized) ActionTimer to anchor against. If
+	// ActionTimer is still 0 the component hasn't run its first movement tick
+	// yet (e.g. called from BeginPlay or a listen-server smoothed pawn): anchoring
+	// to 0 would make the cooldown read as already-expired once ActionTimer passes
+	// CooldownTime. Bail out rather than write a poisoned expiry. Mirrors the guard
+	// in GetNextAvailableEffectID()/GetNextAvailableEffectHandle().
+	if (ActionTimer == 0)
 	{
-		ActiveCooldowns[AbilityTag] = CooldownTime;
+		UE_LOG(LogGMCAbilitySystem, Warning, TEXT("[SetCooldownForAbility] ActionTimer is 0 (component not yet ticked); ignoring cooldown for %s. Set cooldowns after the pawn's movement component is initialized."), *AbilityTag.ToString());
 		return;
 	}
-	ActiveCooldowns.Add(AbilityTag, CooldownTime);
+
+	// Store absolute expiry in ActionTimer units. See the ActiveCooldowns
+	// declaration for why expiry-time (vs remaining-duration) is required to
+	// stay drift-free under GMC client prediction / high client framerate.
+	const double ExpiryActionTime = ActionTimer + static_cast<double>(CooldownTime);
+	ActiveCooldowns.FindOrAdd(AbilityTag) = ExpiryActionTime;
 }
 
 float UGMC_AbilitySystemComponent::GetCooldownForAbility(const FGameplayTag AbilityTag) const
 {
-	if (ActiveCooldowns.Contains(AbilityTag))
+	if (const double* Expiry = ActiveCooldowns.Find(AbilityTag))
 	{
-		return ActiveCooldowns[AbilityTag];
+		const double Remaining = *Expiry - ActionTimer;
+		return Remaining > 0.0 ? static_cast<float>(Remaining) : 0.f;
 	}
 	return 0.f;
 }
@@ -890,12 +903,17 @@ void UGMC_AbilitySystemComponent::TickAncillaryActiveAbilities(float DeltaTime){
 	}
 }
 
-void UGMC_AbilitySystemComponent::TickActiveCooldowns(float DeltaTime)
+void UGMC_AbilitySystemComponent::TickActiveCooldowns(float /*DeltaTime*/)
 {
+	// Cooldowns store absolute expiry times (ActionTimer units), not remaining
+	// durations — see the ActiveCooldowns declaration. This is purely a
+	// garbage-collection pass for entries whose expiry has passed. DeltaTime is
+	// intentionally ignored: ticking this multiple times per real frame (which
+	// GMC's combined-move re-execution does) no longer accumulates drift,
+	// because expiry is a fixed point in time, not a counter being decremented.
 	for (auto It = ActiveCooldowns.CreateIterator(); It; ++It)
 	{
-		It.Value() -= DeltaTime;
-		if (It.Value() <= 0)
+		if (It.Value() <= ActionTimer)
 		{
 			It.RemoveCurrent();
 		}
@@ -1906,15 +1924,40 @@ UGMCAbilityEffect* UGMC_AbilitySystemComponent::ApplyAbilityEffect(UGMCAbilityEf
 	return Effect;
 }
 
-void UGMC_AbilitySystemComponent::RemoveActiveAbilityEffect(UGMCAbilityEffect* Effect)
+void UGMC_AbilitySystemComponent::RemoveActiveAbilityEffect(UGMCAbilityEffect* Effect, bool bAllowAntiDriftDefer)
 {
 	if (Effect == nullptr)
 	{
 		return;
 	}
-	
+
 	if (!ActiveEffects.Contains(Effect->EffectData.EffectID)) return;
-	
+
+	// Anti-drift defer (PREDICTED removals only): a Ticking/Periodic effect keeps applying attribute modifiers
+	// every tick. If one side ends it before the other (the server confirms ~RTT after the client predicts), the
+	// lagging side fires extra modifier chunks and the two diverge — and the gap is frame-rate dependent (far more
+	// chunks at 500fps than at 60fps). Instead of ending now, latch an absolute end timestamp so both sides keep
+	// ticking the same number of times and end on the same logical move tick. Server-authoritative / cleanup
+	// removals pass bAllowAntiDriftDefer=false and end immediately — deferring those would make the CLIENT outlive
+	// the server and drift the other way.
+	const bool bIsNetworked   = GetNetMode() != NM_Standalone;
+	const bool bIsTimeDriven  = Effect->EffectData.EffectType == EGMASEffectType::Ticking
+	                         || Effect->EffectData.EffectType == EGMASEffectType::Periodic;
+	const float EffectiveGraceTime = Effect->EffectData.ClientGraceTime;
+
+	if (bAllowAntiDriftDefer && bIsNetworked && bIsTimeDriven && EffectiveGraceTime > 0.f && !Effect->bCompleted)
+	{
+		// Idempotent arming. Both sides hit this predicted Remove at the same ActionTimer (GMC bound-state
+		// invariant), so they latch the same EndAtActionTimer. Re-arming during the window must be a NO-OP: a
+		// duplicate Remove (e.g. a re-played move, or RPCClientEndEffect landing on a local-replayed Remove)
+		// must not shift the end timestamp, or bilateral symmetry breaks.
+		if (Effect->EndAtActionTimer < 0.0)
+		{
+			Effect->EndAtActionTimer = ActionTimer + EffectiveGraceTime;
+		}
+		return;
+	}
+
 	Effect->EndEffect();
 }
 
@@ -2076,7 +2119,8 @@ bool UGMC_AbilitySystemComponent::RemoveEffectByIdSafe(TArray<int> Ids, EGMCAbil
 				}
 				
 				for (auto Effect : EffectsToRemove) {
-					RemoveActiveAbilityEffect(Effect);
+					// Predicted in-move removal: allow the anti-drift end defer for Ticking/Periodic effects.
+					RemoveActiveAbilityEffect(Effect, /*bAllowAntiDriftDefer=*/true);
 				}
 
 				return true;
@@ -2094,7 +2138,8 @@ bool UGMC_AbilitySystemComponent::RemoveEffectByIdSafe(TArray<int> Ids, EGMCAbil
 					}
 				
 					for (auto Effect : EffectsToRemove) {
-						RemoveActiveAbilityEffect(Effect);
+						// Predicted in-move removal: allow the anti-drift end defer for Ticking/Periodic effects.
+						RemoveActiveAbilityEffect(Effect, /*bAllowAntiDriftDefer=*/true);
 					}
 					
 				}

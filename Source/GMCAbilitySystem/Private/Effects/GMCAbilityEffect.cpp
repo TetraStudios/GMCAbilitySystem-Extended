@@ -190,6 +190,18 @@ void UGMCAbilityEffect::BeginDestroy() {
 
 void UGMCAbilityEffect::Tick(float DeltaTime)
 {
+	// Consume the bilateral predicted-end defer. Uses an absolute ActionTimer timestamp (not a per-tick
+	// countdown): client and server armed the same EndAtActionTimer (same move log + same ClientGraceTime),
+	// so this fires on the exact same logical tick on both sides regardless of DeltaTime / framerate / replay
+	// count. Until it fires the effect keeps ticking normally, so both sides apply the same number of chunks.
+	if (EndAtActionTimer >= 0.0 && OwnerAbilityComponent
+		&& OwnerAbilityComponent->ActionTimer >= EndAtActionTimer)
+	{
+		EndAtActionTimer = -1.0;
+		EndEffect();
+		return;
+	}
+
 	// Aherys : I'm not sure if this is correct. Sometime this is GC. We need to catch why, and when.
 	if (bCompleted || IsUnreachable()) {
 		if (IsUnreachable()) {

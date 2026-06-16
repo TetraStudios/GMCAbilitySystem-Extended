@@ -258,6 +258,15 @@ public:
 
 	bool bCompleted;
 
+	// Anti-drift predicted-end defer, expressed as an ABSOLUTE ActionTimer timestamp (-1.0 = unarmed).
+	// When a Ticking/Periodic effect is removed via a PREDICTED path, the component arms this to
+	// ActionTimer + ClientGraceTime instead of ending immediately. Client and server process that
+	// predicted Remove on the same logical move tick (GMC bound-state invariant) and therefore latch
+	// the same value, so both keep applying the same number of tick/period chunks before EndEffect
+	// fires. Consumed at the top of Tick(). Server-authoritative / cleanup removals never arm this and
+	// end immediately. See UGMC_AbilitySystemComponent::RemoveActiveAbilityEffect.
+	double EndAtActionTimer = -1.0;
+
 	// Time that the client applied this Effect. Used for when a client predicts an effect, if the server has not
 	// confirmed this effect within a time range, the effect will be cancelled.
 	float ClientEffectApplicationTime;
