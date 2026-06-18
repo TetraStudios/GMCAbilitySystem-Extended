@@ -225,8 +225,22 @@ void FGMASBoundQueueV2::ServerAcknowledgeOperation(int ID)
 
 void FGMASBoundQueueV2::CheckValidState() const
 {
-	// Server Logic
-	if (GMCMovementComponent->GetNetMode() < NM_Client)
+	// A pawn that drains its OWN ClientQueuedOperations in GenPreLocalMoveExecution -- a remote
+	// client, a standalone instance, or a LOCALLY-CONTROLLED listen/dedicated-server host pawn --
+	// legitimately holds client operations between that drain and this check. On a listen server
+	// the host's Client RPCs (RPCOnServerOperationAdded) execute LOCALLY for its locally-owned
+	// pawn and populate ClientQueuedOperations server-side; that is expected, not a leak. The
+	// "server" invariant below only applies to a genuine server-SIMULATED REMOTE pawn, so this
+	// gate must mirror GenPreLocalMoveExecution's drain gate exactly or it false-positives (the
+	// "ClientQueuedOperations has N pending operations on server" spam on a listen-server host).
+	const bool bDrainsClientQueue =
+		GMCMovementComponent->GetNetMode() == NM_Client ||
+		GMCMovementComponent->GetNetMode() == NM_Standalone ||
+		GMCMovementComponent->IsLocallyControlledListenServerPawn() ||
+		GMCMovementComponent->IsLocallyControlledDedicatedServerPawn();
+
+	// Server Logic (genuine server-simulated remote pawn only)
+	if (GMCMovementComponent->GetNetMode() < NM_Client && !bDrainsClientQueue)
 	{
 		// Check Client Queued Operations is empty
 		if (ClientQueuedOperations.Num() > 0)
@@ -243,9 +257,9 @@ void FGMASBoundQueueV2::CheckValidState() const
 			}
 		}
 	}
-	else
+	else if (GMCMovementComponent->GetNetMode() >= NM_Client)
 	{
-		// Check Server Queued Operations is empty
+		// Check Server Queued Operations is empty (pure client only)
 		if (ServerQueuedBoundOperationsGracePeriods.Num() > 0)
 		{
 			UE_LOG(LogGMCAbilitySystem, Error, TEXT("ServerQueuedBoundOperationsGracePeriods has %d pending operations on client"), ServerQueuedBoundOperationsGracePeriods.Num());;
