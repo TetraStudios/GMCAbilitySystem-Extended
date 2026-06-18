@@ -39,7 +39,19 @@ void UGMCAbilityEffect::InitializeEffect(FGMCAbilityEffectData InitializationDat
 	// (EffectData.CurrentDuration = OwnerAbilityComponent->ActionTimer - ...) and crash
 	// with EXCEPTION_ACCESS_VIOLATION. Treat a no-owner init as a no-op so existing
 	// state (owner, EffectID, timers) is preserved untouched.
-	if (InitializationData.OwnerAbilityComponent == nullptr)
+	//
+	// Owner resolution: prefer an explicit OwnerAbilityComponent; fall back to
+	// SourceAbilityComponent (the pre-Deep-Worlds behavior). OwnerAbilityComponent is not
+	// Blueprint-writable — only SourceAbilityComponent is exposed on a MakeStruct — so
+	// Blueprint-built init data (e.g. GA_GenericModifier re-running InitializeEffect with a
+	// computed modifier) must be allowed to supply the owner via SourceAbilityComponent.
+	// Still a no-op when BOTH are null, preserving the crash-safety above.
+	UGMC_AbilitySystemComponent* ResolvedOwner =
+		InitializationData.OwnerAbilityComponent
+			? InitializationData.OwnerAbilityComponent
+			: InitializationData.SourceAbilityComponent;
+
+	if (ResolvedOwner == nullptr)
 	{
 		UE_LOG(LogGMCAbilitySystem, Error, TEXT("OwnerAbilityComponent is null in UGMCAbilityEffect::InitializeEffect; ignoring init to preserve existing state."));
 		return;
@@ -47,7 +59,8 @@ void UGMCAbilityEffect::InitializeEffect(FGMCAbilityEffectData InitializationDat
 
 	EffectData = InitializationData;
 
-	OwnerAbilityComponent = EffectData.OwnerAbilityComponent;
+	EffectData.OwnerAbilityComponent = ResolvedOwner;
+	OwnerAbilityComponent = ResolvedOwner;
 
 	ClientEffectApplicationTime = OwnerAbilityComponent->ActionTimer;
 
