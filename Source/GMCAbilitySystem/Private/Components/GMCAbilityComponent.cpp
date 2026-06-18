@@ -2060,19 +2060,39 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 		{
 			if (!BoundQueueV2.HasPayloadByID(SubID))
 			{
-				// A sub-operation whose payload is missing from the cache (expired, never
-				// delivered) cannot be applied on this side. This used to be a SILENT skip:
-				// the batch still reported success, the op landed on the other side only,
-				// and the resulting state divergence had no trace anywhere. Keep skipping
-				// (nothing to apply) and keep it OUT of the ack list — so the server's
-				// grace-timeout drain still has a chance to force it — but log it loudly.
-				UE_LOG(LogGMCAbilitySystem, Error,
-					TEXT("[BatchOp] Sub-operation %d payload missing from cache — NOT applied on this side (batch of %d sub-ops, Authority=%d, Replaying=%d)."),
-					SubID, Batch.SubOperationIDs.Num(), HasAuthority() ? 1 : 0, IsReplayingForGMASLogic() ? 1 : 0);
-				if (HasAuthority())
+				// Missing payload during batch dispatch. On the AUTHORITY this is the EXPECTED,
+				// benign case, NOT a drop: the authority consumes (RemovePayloadByID) each sub-op
+				// as it applies it on the FIRST prediction-tick pass. Any LATER re-entry of the
+				// SAME bound OperationData batch within the same move necessarily finds the
+				// payloads already gone -- and re-entry happens twice by design:
+				//   1) sub-stepped ExecuteMove: GenPredictionTick runs once per iteration with the
+				//      same OperationData (GMCReplicationComponent ExecuteMove loop), and
+				//   2) the ancillary pass: GenAncillaryTick calls ProcessOperation again with
+				//      bFromMovementTick=false.
+				// The sub-op was applied EXACTLY ONCE in the first pass and persists (the sub-step
+				// loop is cumulative, never rolled back). Single ops hit the identical situation
+				// and return SILENTLY via the bCacheHit==false path below (~line 2123, its Error is
+				// commented out). Logging an Error here was therefore a false alarm
+				// ("[BatchOp] ... Authority=1") for a correctly-applied op. NOTE: a sub-op whose
+				// ACTIVATION failed on the first pass is PRESERVED (its payload stays cached), so it
+				// does NOT reach this branch -- it correctly retries on the ancillary pass. Do NOT
+				// "fix" this by bailing the whole batch on the ancillary pass or by clearing
+				// OperationData on success: either would kill that preserved-activation retry path.
+				//
+				// On a CLIENT (!HasAuthority) payloads are never consumed locally (only expired by
+				// ClearStaleOperationData), so a genuinely missing payload means a server-broadcast
+				// op was never delivered / expired before processing -- a real cross-side divergence
+				// worth surfacing. Keep the loud log there only.
+				if (!HasAuthority())
 				{
-					UE_LOG(LogTemp, Error,
-						TEXT("[BatchOp] Sub-operation %d payload missing from cache — NOT applied on this side (batch of %d sub-ops)."),
+					UE_LOG(LogGMCAbilitySystem, Error,
+						TEXT("[BatchOp] Sub-operation %d payload missing from cache — NOT applied on this (client) side (batch of %d sub-ops, Replaying=%d)."),
+						SubID, Batch.SubOperationIDs.Num(), IsReplayingForGMASLogic() ? 1 : 0);
+				}
+				else
+				{
+					UE_LOG(LogGMCAbilitySystem, Verbose,
+						TEXT("[BatchOp] Sub-operation %d already consumed earlier this move (authority re-entry, batch of %d sub-ops) — benign, skipping."),
 						SubID, Batch.SubOperationIDs.Num());
 				}
 				continue;
