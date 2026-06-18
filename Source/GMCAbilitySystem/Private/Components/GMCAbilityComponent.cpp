@@ -595,6 +595,22 @@ bool UGMC_AbilitySystemComponent::TryActivateAbility(const TSubclassOf<UGMCAbili
 				*GetNameSafe(ActivatedAbility), AbilityID);
 			return false;
 		}
+		// Same logical activation, but it already ran AND ended here (instance ended + purged
+		// from ActiveAbilities, recorded in the recently-ended ring by CleanupStaleAbilities).
+		// A late re-delivery of this exact op — a client replay one RTT after a server
+		// correction, or a re-sent operation — must NOT resurrect it: the original run already
+		// played and ended it, and ability instances are not rolled back, so reviving it would
+		// double-play the action. This is the "rapidly activate/deactivate -> re-plays ~1 RTT
+		// later on a laggy client" bug. The recently-ended ring is the existing tombstone for
+		// exactly this "ID already lived and died" case; it just wasn't consulted on activation.
+		// (A genuinely new press gets a new OperationID -> new derived AbilityID, so it is
+		// unaffected; only the same op resurrecting is blocked.)
+		if (WasAbilityRecentlyEnded(AbilityID))
+		{
+			UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability Activation for %s skipped: operation-derived ID %d recently ended (late re-delivery/replay)."),
+				*GetNameSafe(ActivatedAbility), AbilityID);
+			return false;
+		}
 	}
 	else
 	{
