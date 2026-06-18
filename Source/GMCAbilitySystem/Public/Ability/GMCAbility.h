@@ -44,7 +44,9 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "GMCAbilitySystem")
 	FGMCAbilityData AbilityData;
 
-	UPROPERTY()
+	// The live cost-effect instance applied when this ability committed its cost.
+	// Exposed read-only to Blueprints (e.g. to inspect cost duration/attributes).
+	UPROPERTY(BlueprintReadOnly, Category = "GMCAbilitySystem")
 	UGMCAbilityEffect* AbilityCostInstance = nullptr;
 
 
