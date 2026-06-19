@@ -51,6 +51,15 @@ void FAttribute::AddModifier(const FGMCAttributeModifier& PendingModifier) const
 		{
 			RawValue = Clamp.ClampValue(RawValue + ModifierValue);
 		}
+
+		// Refresh Value synchronously so a same-tick read sees the new RawValue instead of last
+		// tick's value. The permanent path is driven every predicted movement tick by the operator
+		// movement graph via SetAttributeValueWithTag (e.g. CurrentSlideTime), which runs BEFORE the
+		// ability component's ProcessAttributes(true) within the move. Without this, a read-modify-write
+		// in the graph (read Value, add dt, set) keeps reading the stale Value and never advances.
+		// bIsDirty is re-set below so ProcessAttributes still recalcs (bound) and the unbound FastArray
+		// replication (MarkAttributeDirty) still fires. Mirrors the EnsureAttributeUpdated pattern above.
+		CalculateValue();
 	}
 
 	bIsDirty = true;
