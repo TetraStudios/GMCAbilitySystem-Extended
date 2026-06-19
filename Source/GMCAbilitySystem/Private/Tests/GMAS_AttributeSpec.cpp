@@ -127,6 +127,59 @@ void FGMASAttributeSpec::Define()
 			Attr.CalculateValue();
 			TestEqual("InitialValue unchanged", Attr.InitialValue, 100.f);
 		});
+
+		It("refreshes Value synchronously after a permanent Add (no manual CalculateValue)", [this]()
+		{
+			// Regression: AddModifier's permanent path must refresh Value itself. Previously only RawValue
+			// was written and Value stayed stale until a later ProcessAttributes/CalculateValue pass — which,
+			// from the predicted movement graph, runs AFTER the write within the move (a same-tick read got
+			// the old value). NOTE: deliberately no manual CalculateValue() call here.
+			FAttribute Attr = MakeAttr(100.f);
+			Attr.AddModifier(MakePermanentMod(25.f));
+			TestEqual("RawValue updated to 125", Attr.RawValue, 125.f);
+			TestEqual("Value updated to 125 synchronously", Attr.Value, 125.f);
+		});
+
+		It("refreshes Value synchronously after a permanent Set (no manual CalculateValue)", [this]()
+		{
+			FAttribute Attr = MakeAttr(100.f);
+			FGMCAttributeModifier Mod;
+			Mod.Op = EModifierType::Set;
+			Mod.ValueType = EGMCAttributeModifierType::AMT_Value;
+			Mod.ModifierValue = 42.f;
+			Mod.bRegisterInHistory = false;
+			Attr.AddModifier(Mod); // no manual CalculateValue()
+			TestEqual("RawValue set to 42", Attr.RawValue, 42.f);
+			TestEqual("Value reflects the Set synchronously", Attr.Value, 42.f);
+		});
+
+		It("same-tick read-modify-write accumulates without drift", [this]()
+		{
+			// Mirrors the predicted movement-graph accumulator (read Value, add dt, Set) that runs before
+			// ProcessAttributes within a move. Each iteration must read the value the previous Set wrote;
+			// before the fix, Value stayed at 0 so every iteration wrote 0+dt and it never advanced.
+			FAttribute Attr = MakeAttr(0.f);
+			const float Dt = 0.1f;
+			for (int i = 0; i < 3; ++i)
+			{
+				FGMCAttributeModifier SetMod;
+				SetMod.Op = EModifierType::Set;
+				SetMod.ValueType = EGMCAttributeModifierType::AMT_Value;
+				SetMod.ModifierValue = Attr.Value + Dt; // read-modify (reads the freshly-refreshed Value)
+				SetMod.bRegisterInHistory = false;
+				Attr.AddModifier(SetMod);               // write
+			}
+			TestEqual("Accumulated 3 * 0.1 = 0.3 with no drift", Attr.Value, 0.3f);
+		});
+
+		It("preserves the dirty flag after a permanent modifier (replication intact)", [this]()
+		{
+			// The synchronous CalculateValue() clears bIsDirty; the permanent path must re-set it so
+			// ProcessAttributes still recalcs (bound) and the unbound FastArray replication still fires.
+			FAttribute Attr = MakeAttr(100.f);
+			Attr.AddModifier(MakePermanentMod(50.f));
+			TestTrue("bIsDirty remains true after a permanent modifier", Attr.IsDirty());
+		});
 	});
 
 	Describe("Temporal modifiers (bRegisterInHistory=true)", [this]()
