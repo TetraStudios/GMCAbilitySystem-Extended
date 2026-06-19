@@ -194,9 +194,20 @@ bool UGMC_AbilitySystemComponent::BoundActiveEffectIDs_Contains(int EffectID) co
 void UGMC_AbilitySystemComponent::GenAncillaryTick(float DeltaTime, bool bIsCombinedClientMove)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(UGMC_AbilitySystemComponent::GenAncillaryTick)
-	
+
 	// Caution if you override Ancillarytick, this value should wrap up the override.
 	bInAncillaryTick = true;
+
+	// Refresh ActionTimer to current move timestamp. GenAncillaryTick runs outside GenPredictionTick,
+	// so ActionTimer is stale (set during GenPredictionTick). Operations processed here (deferred
+	// ability activations, grace-period forced effects) must use current ActionTimer so predicted
+	// effects are anchored to the current move, not a historical one. Without this refresh, effects
+	// compute StartTime from a stale ActionTimer, causing periodic drain ticks to be offset on server
+	// relative to client (client applies during GenPredictionTick at current ActionTimer).
+	if (GMCMovementComponent)
+	{
+		ActionTimer = GMCMovementComponent->GetMoveTimestamp();
+	}
 
 	// Drain any PredictedQueued operations buffered since the last tick.
 	DrainPendingPredictedOperations();
@@ -1048,6 +1059,17 @@ void UGMC_AbilitySystemComponent::BoundQueueV2Debug(TSubclassOf<UGMCAbilityEffec
 void UGMC_AbilitySystemComponent::OnServerOperationForced(FInstancedStruct OperationData)
 {
 	UE_LOG(LogTemp, Warning, TEXT("Forcing Operation On Server"));
+	// Refresh ActionTimer to current move timestamp before processing forced operation.
+	// Grace period timeout (GenAncillaryTick) fires outside GenPredictionTick, so ActionTimer
+	// is stale (set during the last prediction tick). Predicted effects compute StartTime from
+	// ActionTimer at apply time (InitializeEffect:75); a stale ActionTimer causes the effect
+	// to be anchored to a historical move-timestamp, delaying periodic drain ticks on server
+	// relative to client (which applies during GenPredictionTick at current ActionTimer).
+	// Refresh ensures effect StartTime is stamped with the current move, not a past one.
+	if (GMCMovementComponent)
+	{
+		ActionTimer = GMCMovementComponent->GetMoveTimestamp();
+	}
 	ProcessOperation(OperationData, false, true);
 }
 
