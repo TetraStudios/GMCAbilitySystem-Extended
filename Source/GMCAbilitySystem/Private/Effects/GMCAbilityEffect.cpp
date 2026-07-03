@@ -30,16 +30,31 @@ FGMCAbilityEffectData UGMCAbilityEffect::GetDefaultEffectData(TSubclassOf<UGMCAb
 
 void UGMCAbilityEffect::InitializeEffect(FGMCAbilityEffectData InitializationData)
 {
-	EffectData = InitializationData;
-	
-	OwnerAbilityComponent = EffectData.OwnerAbilityComponent;
-	
-	if (OwnerAbilityComponent == nullptr)
+	// Resolve the owning component BEFORE assigning any state. Pre-fork, a null
+	// OwnerAbilityComponent fell back to SourceAbilityComponent — Blueprint callers that only
+	// set Source (this function is BlueprintCallable) relied on that; the fork dropped the
+	// fallback, leaving such effects with a null owner that TickActiveEffects then
+	// dereferences (access violation at ActionTimer). Restore the fallback, and when BOTH are
+	// null bail without touching EffectData/OwnerAbilityComponent so a bad call can't corrupt
+	// a live instance — or a shared CDO, which pre-assignment corruption also poisoned.
+	UGMC_AbilitySystemComponent* ResolvedOwner = InitializationData.OwnerAbilityComponent;
+	if (ResolvedOwner == nullptr)
 	{
-		UE_LOG(LogGMCAbilitySystem, Error, TEXT("OwnerAbilityComponent is null in UGMCAbilityEffect::InitializeEffect"));
+		ResolvedOwner = InitializationData.SourceAbilityComponent;
+	}
+	if (ResolvedOwner == nullptr)
+	{
+		UE_LOG(LogGMCAbilitySystem, Error,
+			TEXT("UGMCAbilityEffect::InitializeEffect (%s): OwnerAbilityComponent and "
+			     "SourceAbilityComponent are both null — effect left uninitialized."),
+			*GetName());
 		return;
 	}
-	
+
+	EffectData = InitializationData;
+
+	OwnerAbilityComponent = ResolvedOwner;
+
 	ClientEffectApplicationTime = OwnerAbilityComponent->ActionTimer;
 
 	// If server sends times, use those
@@ -240,6 +255,22 @@ void UGMCAbilityEffect::Tick(float DeltaTime)
 	// Shipping (macro + argument compiled out when CPUPROFILERTRACE_ENABLED == 0).
 	TRACE_CPUPROFILER_EVENT_SCOPE_TEXT(*FString::Printf(TEXT("Effect::Tick [%s]"),
 		EffectData.EffectTag.IsValid() ? *EffectData.EffectTag.ToString() : *GetClass()->GetName()));
+
+	// Never tick without an owning component — everything below (CurrentDuration, tag checks,
+	// modifier application) dereferences it. InitializeEffect refuses to produce an unowned
+	// effect, but a direct Blueprint InitializeEffect call on a live instance can still null
+	// the owner; skipping beats the access violation this used to be.
+	if (OwnerAbilityComponent == nullptr)
+	{
+		if (!bLoggedNullOwnerTick)
+		{
+			bLoggedNullOwnerTick = true;
+			UE_LOG(LogGMCAbilitySystem, Error,
+				TEXT("UGMCAbilityEffect::Tick (%s): OwnerAbilityComponent is null — effect will "
+				     "not tick. Was InitializeEffect called without an owner?"), *GetName());
+		}
+		return;
+	}
 
 	// Consume the bilateral predicted-end defer. Uses an absolute ActionTimer timestamp instead of a
 	// per-tick countdown — both client and server compute the same EndAtActionTimer (same move log,

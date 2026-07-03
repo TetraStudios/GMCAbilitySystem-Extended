@@ -361,6 +361,10 @@ public:
 	// Validated (real EndEffect runs) or Timeout (OLD is revived).
 	bool bPendingDeathBySuccessor = false;
 
+	// Rate-limits the null-owner error in Tick to once per instance (Tick runs at prediction
+	// frequency — an unowned zombie effect would otherwise spam hundreds of lines per second).
+	bool bLoggedNullOwnerTick = false;
+
 	// Time that the client applied this Effect. Used for when a client predicts an effect, if the server has not
 	// confirmed this effect within a time range, the effect will be cancelled.
 	float ClientEffectApplicationTime;
