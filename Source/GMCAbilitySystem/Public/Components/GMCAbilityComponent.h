@@ -471,6 +471,16 @@ public:
 	UFUNCTION(BlueprintCallable, DisplayName="Count Queued Ability Instances", Category="GMAS|Abilities")
 	int32 GetQueuedAbilityCount(FGameplayTag AbilityTag);
 
+	/**
+	 * Number of ability-activation operations for InputTag that are "in flight": queued locally
+	 * but not yet drained into a move (client), or broadcast but not yet acknowledged (server).
+	 * Consumed by QueueAbility's bPreventConcurrentActivation guard so poll-until-active callers
+	 * (queue every movement tick until the ability's state tag appears) enqueue at most one
+	 * activation operation per input tag instead of one per tick.
+	 */
+	UFUNCTION(BlueprintCallable, DisplayName="Count Pending Ability Activations", Category="GMAS|Abilities")
+	int32 GetPendingAbilityActivationCount(FGameplayTag InputTag);
+
 	UFUNCTION(BlueprintCallable, DisplayName="Count Activated Ability Instances", Category="GMAS|Abilities")
 	int32 GetActiveAbilityCount(TSubclassOf<UGMCAbility> AbilityClass);
 

@@ -765,6 +765,18 @@ void UGMC_AbilitySystemComponent::QueueAbility(FGameplayTag InputTag, const UInp
 {
 	if (GetOwnerRole() != ROLE_AutonomousProxy && GetOwnerRole() != ROLE_Authority) return;
 
+	// GMC replay re-executes prediction ticks: activation operations queued live are re-delivered
+	// through the bound operation slot / payload cache and deduplicated by their operation-derived
+	// IDs. Queueing fresh here during replay would mint NEW operation IDs for decisions that were
+	// already captured in the move history, flooding the queue after every correction (one spurious
+	// op per replayed tick that polls). Skip entirely; live ticks re-poll next frame anyway.
+	if (IsReplayingForGMASLogic()) return;
+
+	// Early local check: input tags with no ability mapping never enqueue (pre-V2 behavior).
+	// Also keeps GetGrantedAbilitiesByTag from logging a not-granted warning per polled tick.
+	const FAbilityMapData* MapEntry = AbilityMap.Find(InputTag);
+	if (MapEntry == nullptr || MapEntry->Abilities.IsEmpty()) return;
+
 	// Detect client-auth path before standard routing.
 	TArray<TSubclassOf<UGMCAbility>> Candidates = GetGrantedAbilitiesByTag(InputTag);
 	for (const TSubclassOf<UGMCAbility>& AbilityClass : Candidates)
@@ -788,6 +800,20 @@ void UGMC_AbilitySystemComponent::QueueAbility(FGameplayTag InputTag, const UInp
 		// else fall through to standard path
 	}
 
+	// Honor bPreventConcurrentActivation (the parameter had become a no-op in the V2 queue
+	// refactor; this restores the pre-fork guard contract). Poll-until-active callers queue
+	// every movement tick until the ability's state appears, so without this guard every tick
+	// enqueues another operation: each one is a bound-state change that defeats GMC move
+	// combining and each surplus op burns an activation attempt on both machines.
+	if (bPreventConcurrentActivation)
+	{
+		// An instance granted by this input tag is already running: nothing to do.
+		if (GetActiveAbilityCountByTag(InputTag) > 0) return;
+		// An activation operation for this input tag is already in flight (queued locally or
+		// awaiting acknowledgement): let it resolve before another may be enqueued.
+		if (GetPendingAbilityActivationCount(InputTag) > 0) return;
+	}
+
 	// Existing standard flow continues unchanged below.
 	FGMASBoundQueueV2AbilityActivationOperation ActivationData;
 	ActivationData.InputTag = InputTag;
@@ -809,6 +835,35 @@ int32 UGMC_AbilitySystemComponent::GetQueuedAbilityCount(FGameplayTag AbilityTag
 {
 	return 0;
 	// return QueuedAbilityOperations.NumMatching(AbilityTag, EGMASBoundQueueOperationType::Activate);
+}
+
+int32 UGMC_AbilitySystemComponent::GetPendingAbilityActivationCount(FGameplayTag InputTag)
+{
+	int32 Result = 0;
+
+	auto CountIfMatchingActivation = [this, &InputTag, &Result](const int OperationID)
+	{
+		const FInstancedStruct Payload = BoundQueueV2.GetPayloadByID(OperationID);
+		if (Payload.GetScriptStruct() == FGMASBoundQueueV2AbilityActivationOperation::StaticStruct() &&
+			Payload.Get<FGMASBoundQueueV2AbilityActivationOperation>().InputTag == InputTag)
+		{
+			Result++;
+		}
+	};
+
+	// Client-origin operations queued but not yet drained into a move by GenPreLocalMoveExecution.
+	for (const int OperationID : BoundQueueV2.ClientQueuedOperations)
+	{
+		CountIfMatchingActivation(OperationID);
+	}
+
+	// Server-origin operations broadcast to the client but not yet acknowledged (grace pending).
+	for (const TPair<int, float>& Pending : BoundQueueV2.ServerQueuedBoundOperationsGracePeriods)
+	{
+		CountIfMatchingActivation(Pending.Key);
+	}
+
+	return Result;
 }
 
 int32 UGMC_AbilitySystemComponent::GetActiveAbilityCount(TSubclassOf<UGMCAbility> AbilityClass)
