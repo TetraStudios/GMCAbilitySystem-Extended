@@ -309,6 +309,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
 	void RemoveGrantedAbilityByTag(const FGameplayTag AbilityTag);
 
+	// BP-compat restore (removed upstream in the DeepWorlds fork; pre-fork Blueprints reference
+	// this node by name). Same specifiers as pre-fork: Callable (not Pure) so placed nodes keep
+	// their exec pins. C++ callers can use the equivalent GetGrantedAbilities() above.
+	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
+	FGameplayTagContainer GetGrantedAbilityTags() const;
+
 	UFUNCTION(BlueprintPure, meta=(Categories="Ability"), Category = "GMCAbilitySystem")
 	bool HasGrantedAbilityTag(const FGameplayTag GameplayTag) const;
 
