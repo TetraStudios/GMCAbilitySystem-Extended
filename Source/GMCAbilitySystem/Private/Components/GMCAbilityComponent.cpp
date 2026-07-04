@@ -144,17 +144,23 @@ void UGMC_AbilitySystemComponent::BindReplicationData()
 		// Combine mode is per-attribute (FAttributeData::ValueCombineMode, default CombineIfUnchanged). An attribute
 		// that changes every prediction tick (e.g. Stamina drain/regen) and does NOT feed movement can opt into
 		// AlwaysCombineOverwrite to stop defeating GMC move-combining. Applied to both Value and RawValue.
+		// The debug names make GMC's validation-failure logs identify the attribute directly
+		// ("Attribute.MoveSpeed.Value[10] was not valid") instead of the anonymous wire type
+		// ("SinglePrecisionFloat[10]") — attribute pairs are otherwise indistinguishable from
+		// any other bound float. Diagnostic metadata only; never serialized or compared.
 		AttributeForBind.BoundIndex = GMCMovementComponent->BindSinglePrecisionFloat(AttributeForBind.Value,
 			EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
 			AttributeForBind.ValueCombineMode,
 			EGMC_SimulationMode::Periodic_Output,
-			EGMC_InterpolationFunction::TargetValue);
+			EGMC_InterpolationFunction::TargetValue,
+			FString::Printf(TEXT("%s.Value"), *AttributeForBind.Tag.ToString()));
 
 		GMCMovementComponent->BindSinglePrecisionFloat(AttributeForBind.RawValue,
 		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
 		AttributeForBind.ValueCombineMode,
 		EGMC_SimulationMode::Periodic_Output,
-		EGMC_InterpolationFunction::TargetValue);
+		EGMC_InterpolationFunction::TargetValue,
+		FString::Printf(TEXT("%s.RawValue"), *AttributeForBind.Tag.ToString()));
 	}
 	
 	// Granted Abilities
@@ -162,27 +168,31 @@ void UGMC_AbilitySystemComponent::BindReplicationData()
 		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
 		EGMC_CombineMode::CombineIfUnchanged,
 		EGMC_SimulationMode::None,
-		EGMC_InterpolationFunction::TargetValue);
+		EGMC_InterpolationFunction::TargetValue,
+		TEXT("GMAS.GrantedAbilityTags"));
 
 	// Active Tags
 	GMCMovementComponent->BindGameplayTagContainer(ActiveTags,
 		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
 		EGMC_CombineMode::CombineIfUnchanged,
 		EGMC_SimulationMode::Periodic_Output,
-		EGMC_InterpolationFunction::TargetValue);
-	
+		EGMC_InterpolationFunction::TargetValue,
+		TEXT("GMAS.ActiveTags"));
+
 	// TaskData Bind
 	GMCMovementComponent->BindInstancedStruct(TaskData,
 		EGMC_PredictionMode::ClientAuth_Input,
 		EGMC_CombineMode::CombineIfUnchanged,
 		EGMC_SimulationMode::None,
-		EGMC_InterpolationFunction::TargetValue);
+		EGMC_InterpolationFunction::TargetValue,
+		TEXT("GMAS.TaskData"));
 
 	GMCMovementComponent->BindBool(bJustTeleported,
 		EGMC_PredictionMode::ServerAuth_Output_ClientValidated,
 		EGMC_CombineMode::CombineIfUnchanged,
 		EGMC_SimulationMode::PeriodicAndOnChange_Output,
-		EGMC_InterpolationFunction::TargetValue);
+		EGMC_InterpolationFunction::TargetValue,
+		TEXT("GMAS.bJustTeleported"));
 
 	BoundQueueV2.BindToGMC(GMCMovementComponent);
 
@@ -197,7 +207,8 @@ void UGMC_AbilitySystemComponent::BindReplicationData()
 		EGMC_PredictionMode::ServerAuth_Output_ServerValidated,
 		EGMC_CombineMode::CombineIfUnchanged,
 		EGMC_SimulationMode::Periodic_Output,
-		EGMC_InterpolationFunction::TargetValue);
+		EGMC_InterpolationFunction::TargetValue,
+		TEXT("GMAS.ActiveEffectIDs"));
 }
 
 void UGMC_AbilitySystemComponent::BoundActiveEffectIDs_Add(int EffectID)

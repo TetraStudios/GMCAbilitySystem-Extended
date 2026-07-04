@@ -70,7 +70,8 @@ void FGMASBoundQueueV2::BindToGMC(UGMC_MovementUtilityCmp* MovementComponent)
 		EGMC_PredictionMode::ClientAuth_InputOutput,
 		EGMC_CombineMode::CombineIfUnchanged,
 		EGMC_SimulationMode::None,
-		EGMC_InterpolationFunction::TargetValue);
+		EGMC_InterpolationFunction::TargetValue,
+		TEXT("GMAS.BoundQueueV2.OperationData"));
 	
 	GMCMovementComponent = MovementComponent;
 }
