@@ -104,33 +104,11 @@ bool UGMCAbilityEffect::InitializeEffectQueued(FGMCAbilityEffectData Initializat
 		return false;
 	}
 
-	// Non-authority: intentional no-op. The BP flow runs on both machines; only the
-	// server's call queues, and the queued operation applies the effect on both sides
-	// at the same point in the GMC move pipeline.
-	if (!ResolvedOwner->IsAuthorityForGMASLogic())
-	{
-		UE_LOG(LogGMCAbilitySystem, Verbose,
-			TEXT("UGMCAbilityEffect::InitializeEffectQueued (%s): non-authority call ignored — "
-			     "the server's queued operation applies on both machines."),
-			*GetName());
-		return false;
-	}
-
-	// Everything below is the standard ApplyAbilityEffect ServerAuth path — this function
-	// deliberately adds no queueing/dispatch logic of its own so future changes to
-	// ApplyAbilityEffect are inherited without touching this wrapper.
-	bool bSuccess = false;
-	int EffectHandle = -1;
-	int EffectId = -1;
-	UGMCAbilityEffect* AppliedEffect = nullptr;
-	ResolvedOwner->ApplyAbilityEffectSafe(GetClass(), InitializationData,
-		EGMCAbilityEffectQueueType::ServerAuth, bSuccess, EffectHandle, EffectId, AppliedEffect, nullptr);
-
-	if (bSuccess)
-	{
-		OutEffectId = EffectId;
-	}
-	return bSuccess;
+	// All semantics live on the component so they are shared with any other caller and
+	// inherit every future ApplyAbilityEffect change: first call queues one ServerAuth
+	// apply operation; repeat calls coalesce while it is in flight, then update the
+	// live instance's data in place (same instance — OnInitialEffectApplied fires once).
+	return ResolvedOwner->QueueOrUpdateEffectByClass(GetClass(), InitializationData, OutEffectId);
 }
 
 

@@ -615,6 +615,153 @@ void FGMASEffectSpec::Define()
 			AbilityComp->ProcessEffectApplicationFromOperationForTest(Payload.Get<FGMASBoundQueueV2ApplyEffectOperation>());
 			TestEqual("Re-dispatch is idempotent", AbilityComp->GetActiveEffects().Num(), 1);
 		});
+
+		// ── Coalescing: one logical application per effect class ─────────────────
+		// The old InitializeEffect pattern re-called the function on the SAME held
+		// object every tick: repeat calls updated data in place and never re-fired
+		// OnInitialEffectApplied (bHasAppliedEffect is per-instance). The queued
+		// variant must preserve that: first call = one operation; repeat calls
+		// while pending = nothing; repeat calls once live = in-place data update on
+		// the same instance (no new op, no new instance, no initial-apply re-fire).
+
+		It("coalesces repeat calls while the first operation is still pending", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			FGMCAbilityEffectData Data;
+			Data.EffectType = EGMASEffectType::Persistent;
+			Data.OwnerAbilityComponent = AbilityComp;
+			Data.Modifiers.Add(MakeHealthMod(25.f));
+
+			int32 Id1 = 0, Id2 = 0;
+			const bool bFirst  = GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, Id1);
+			Data.Modifiers[0].ModifierValue = 40.f;  // per-tick "variable update"
+			const bool bSecond = GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, Id2);
+
+			TestTrue ("First call queues", bFirst);
+			TestTrue ("Second call succeeds without queueing", bSecond);
+			TestEqual("Both calls report the same effect id", Id2, Id1);
+			TestEqual("Still exactly one server operation",
+				AbilityComp->GetBoundQueueV2ForTest().ServerQueuedBoundOperationsGracePeriods.Num(), 1);
+			TestEqual("Still exactly one cached payload",
+				AbilityComp->GetBoundQueueV2ForTest().GetPayloadCount(), 1);
+			TestTrue ("Still nothing applied inline", AbilityComp->GetActiveEffects().IsEmpty());
+		});
+
+		It("updates the live instance in place on repeat calls - same instance, no new operations", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			FGMCAbilityEffectData Data;
+			Data.EffectType = EGMASEffectType::Persistent;
+			Data.Duration   = 0.f;
+			Data.OwnerAbilityComponent = AbilityComp;
+			Data.GrantedTags.AddTag(BurningTag);
+			Data.Modifiers.Add(MakeHealthMod(25.f));
+
+			int32 EffectId = 0;
+			TestTrue("Initial call queues", GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, EffectId));
+
+			// Apply the queued op the way the move pipeline would.
+			TArray<int> QueuedIDs;
+			AbilityComp->GetBoundQueueV2ForTest().ServerQueuedBoundOperationsGracePeriods.GetKeys(QueuedIDs);
+			if (QueuedIDs.Num() != 1) { AddError(TEXT("Expected exactly one queued operation")); return; }
+			const FInstancedStruct Payload = AbilityComp->GetBoundQueueV2ForTest().GetPayloadByID(QueuedIDs[0]);
+			AbilityComp->ProcessEffectApplicationFromOperationForTest(Payload.Get<FGMASBoundQueueV2ApplyEffectOperation>());
+			AbilityComp->GenPredictionTick(1.f);
+
+			if (!AbilityComp->GetActiveEffects().Contains(EffectId)) { AddError(TEXT("Effect not live after dispatch")); return; }
+			UGMCAbilityEffect* LiveBefore = AbilityComp->GetActiveEffects()[EffectId];
+			const double StartTimeBefore = LiveBefore->EffectData.StartTime;
+
+			// Per-tick update: new modifier value, and an (ignored) attempt to change grants.
+			FGMCAbilityEffectData Update;
+			Update.EffectType = EGMASEffectType::Persistent;
+			Update.OwnerAbilityComponent = AbilityComp;
+			Update.GrantedTags.AddTag(BurningTag);
+			Update.GrantedTags.AddTag(HealthTag);  // must NOT be adopted post-application
+			Update.Modifiers.Add(MakeHealthMod(40.f));
+
+			int32 UpdateId = 0;
+			TestTrue ("Update call succeeds", GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Update, UpdateId));
+			TestEqual("Update reports the live effect id", UpdateId, EffectId);
+
+			TestEqual("No additional server operation queued",
+				AbilityComp->GetBoundQueueV2ForTest().ServerQueuedBoundOperationsGracePeriods.Num(), 1);
+			TestEqual("Exactly one live effect instance", AbilityComp->GetActiveEffects().Num(), 1);
+			TestTrue ("Same instance object (no re-application => no OnInitialEffectApplied re-fire)",
+				AbilityComp->GetActiveEffects()[EffectId] == LiveBefore);
+
+			const FGMCAbilityEffectData& LiveData = LiveBefore->EffectData;
+			TestEqual("Modifier value adopted from the update", LiveData.Modifiers[0].ModifierValue, 40.f);
+			TestEqual("EffectID preserved", LiveData.EffectID, static_cast<int>(EffectId));
+			TestEqual("StartTime preserved", LiveData.StartTime, StartTimeBefore);
+			TestEqual("Granted tags locked at application time", LiveData.GrantedTags.Num(), 1);
+			TestTrue ("Original granted tag intact", LiveData.GrantedTags.HasTagExact(BurningTag));
+		});
+
+		It("lets non-authority update the live instance once the operation has applied", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			FGMCAbilityEffectData Data;
+			Data.EffectType = EGMASEffectType::Persistent;
+			Data.OwnerAbilityComponent = AbilityComp;
+			Data.Modifiers.Add(MakeHealthMod(25.f));
+
+			int32 EffectId = 0;
+			TestTrue("Initial call queues", GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, EffectId));
+
+			TArray<int> QueuedIDs;
+			AbilityComp->GetBoundQueueV2ForTest().ServerQueuedBoundOperationsGracePeriods.GetKeys(QueuedIDs);
+			if (QueuedIDs.Num() != 1) { AddError(TEXT("Expected exactly one queued operation")); return; }
+			const FInstancedStruct Payload = AbilityComp->GetBoundQueueV2ForTest().GetPayloadByID(QueuedIDs[0]);
+			AbilityComp->ProcessEffectApplicationFromOperationForTest(Payload.Get<FGMASBoundQueueV2ApplyEffectOperation>());
+			AbilityComp->GenPredictionTick(1.f);
+
+			// Now act as the client: live instance exists locally, updates apply in place.
+			AbilityComp->bForceAuthorityForTest = false;
+
+			FGMCAbilityEffectData Update = Data;
+			Update.Modifiers[0].ModifierValue = 40.f;
+			int32 UpdateId = 0;
+			TestTrue ("Non-authority update succeeds against the live instance",
+				GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Update, UpdateId));
+			TestEqual("Non-authority update reports the live effect id", UpdateId, EffectId);
+			TestEqual("No new operations from non-authority",
+				AbilityComp->GetBoundQueueV2ForTest().ServerQueuedBoundOperationsGracePeriods.Num(), 1);
+			if (AbilityComp->GetActiveEffects().Contains(EffectId))
+			{
+				TestEqual("Modifier value updated in place",
+					AbilityComp->GetActiveEffects()[EffectId]->EffectData.Modifiers[0].ModifierValue, 40.f);
+			}
+		});
+
+		It("re-queues after the pending window when the operation never applied", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			FGMCAbilityEffectData Data;
+			Data.EffectType = EGMASEffectType::Persistent;
+			Data.OwnerAbilityComponent = AbilityComp;
+			Data.Modifiers.Add(MakeHealthMod(25.f));
+
+			int32 Id1 = 0;
+			TestTrue("Initial call queues", GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, Id1));
+
+			// Beyond the pending window with no application: the effect was lost
+			// (rejected op / ended) — a fresh call must be allowed to re-apply.
+			AbilityComp->ActionTimer = 1.0 + UGMC_AbilitySystemComponent::QueuedEffectPendingWindow + 1.0;
+
+			int32 Id2 = 0;
+			TestTrue ("Post-window call queues again", GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, Id2));
+			TestEqual("A second server operation now exists",
+				AbilityComp->GetBoundQueueV2ForTest().ServerQueuedBoundOperationsGracePeriods.Num(), 2);
+		});
 	});
 }
 

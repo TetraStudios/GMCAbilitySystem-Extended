@@ -128,6 +128,22 @@ struct FGMCEffectSnapshot
 	FGameplayTag EffectTag;
 };
 
+// Bookkeeping entry for QueueOrUpdateEffectByClass: one outstanding queued-but-not-yet-
+// applied ServerAuth apply operation per effect class. Suppresses duplicate queueing while
+// the operation is in flight; expires after QueuedEffectPendingWindow so a lost application
+// (rejected/expired operation, or an effect that ended before the next call) can re-queue.
+USTRUCT()
+struct FGMASPendingQueuedEffect
+{
+	GENERATED_BODY()
+
+	UPROPERTY()
+	int32 EffectId = -1;
+
+	UPROPERTY()
+	double QueuedAtActionTimer = 0.0;
+};
+
 UENUM(BlueprintType)
 enum class EGMCAbilityEffectQueueType : uint8
 {
@@ -211,6 +227,35 @@ public:
 	// ~715.8M ids ≈ 82.8 days of continuous ActionTimer. A match uses ~0.1%.
 	static constexpr int32 ServerAuthEffectIDOffset = 0x2AAAAAAA; // 715827882   (~ INT32_MAX / 3)
 	static constexpr int32 ClientAuthEffectIDOffset = 0x55555554; // 1431655764  (~ 2 * INT32_MAX / 3)
+
+	// How long (in ActionTimer seconds) a queued-but-not-yet-applied apply operation from
+	// QueueOrUpdateEffectByClass suppresses re-queueing for the same effect class. Sized to
+	// comfortably cover the op's server->client round trip + the 1s server grace timeout;
+	// after this window with no live instance the application is considered lost and a
+	// fresh call may queue again.
+	static constexpr double QueuedEffectPendingWindow = 2.0;
+
+	// First live (not Ended) active effect whose exact class matches EffectClass, or null.
+	// Exact class match — a Blueprint child class is a distinct key from its parent.
+	UFUNCTION(BlueprintPure, Category="GMAS|Effects")
+	UGMCAbilityEffect* FindActiveEffectByClass(TSubclassOf<UGMCAbilityEffect> EffectClass) const;
+
+	// Coalescing apply-or-update, keyed by effect class — the op-queued counterpart of
+	// "repeatedly call InitializeEffect on the same held effect object". One logical
+	// application per class:
+	//   - no live instance (authority): queues ONE ServerAuth apply operation via the
+	//     standard ApplyAbilityEffect path; repeat calls while that operation is in
+	//     flight coalesce to nothing (see QueuedEffectPendingWindow)
+	//   - live instance exists (any machine): updates its EffectData in place — same
+	//     instance, StartEffect is NOT re-run, OnInitialEffectApplied does NOT re-fire,
+	//     no operation is created. Modifier values and maintenance settings adopt the
+	//     caller's data; identity/lifecycle/grant fields (EffectID, timing, EffectType,
+	//     GrantedTags/GrantedAbilities) stay locked from application time
+	//   - no live instance (non-authority): no-op returning false — the server's queued
+	//     operation applies the effect on both machines
+	// Safe to call every tick. Returns true with OutEffectId = the live or reserved id.
+	UFUNCTION(BlueprintCallable, Category="GMAS|Effects")
+	bool QueueOrUpdateEffectByClass(TSubclassOf<UGMCAbilityEffect> EffectClass, FGMCAbilityEffectData InitializationData, int32& OutEffectId);
 
 	// Will apply the starting effects and abilities to the component,
 	// bForce will re-apply the effects, usefull if we want to re-apply the effects after a reset (like a death)
@@ -1026,6 +1071,12 @@ private:
 	// Local buffer for PredictedQueued operations called outside of a movement tick.
 	// Both client and server maintain this independently — no replication needed.
 	TArray<FInstancedStruct> PendingPredictedOperations;
+
+	// QueueOrUpdateEffectByClass bookkeeping: in-flight queued applies keyed by effect
+	// class. Authority-only entries (only the server originates ServerAuth applies);
+	// transient, never replicated — cross-machine symmetry comes from the operation.
+	UPROPERTY(Transient)
+	TMap<TSubclassOf<UGMCAbilityEffect>, FGMASPendingQueuedEffect> PendingQueuedEffectsByClass;
 
 	// Drains all buffered PredictedQueued operations. Called at the start of
 	// GenPredictionTick and GenAncillaryTick.

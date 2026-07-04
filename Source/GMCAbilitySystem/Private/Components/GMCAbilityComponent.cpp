@@ -3109,6 +3109,113 @@ void UGMC_AbilitySystemComponent::RemoveEffectHandle(int EffectHandle)
 	EffectHandles.Remove(EffectHandle);
 }
 
+UGMCAbilityEffect* UGMC_AbilitySystemComponent::FindActiveEffectByClass(TSubclassOf<UGMCAbilityEffect> EffectClass) const
+{
+	if (!EffectClass)
+	{
+		return nullptr;
+	}
+	for (const TPair<int, UGMCAbilityEffect*>& Pair : ActiveEffects)
+	{
+		if (Pair.Value && Pair.Value->GetClass() == EffectClass.Get() &&
+			Pair.Value->CurrentState != EGMASEffectState::Ended)
+		{
+			return Pair.Value;
+		}
+	}
+	return nullptr;
+}
+
+
+bool UGMC_AbilitySystemComponent::QueueOrUpdateEffectByClass(TSubclassOf<UGMCAbilityEffect> EffectClass,
+                                                             FGMCAbilityEffectData InitializationData, int32& OutEffectId)
+{
+	OutEffectId = -1;
+	if (!EffectClass)
+	{
+		UE_LOG(LogGMCAbilitySystem, Error, TEXT("QueueOrUpdateEffectByClass: EffectClass is null."));
+		return false;
+	}
+
+	// 1) Live instance: this call is a data update. Mirrors the semantics of repeatedly
+	// calling InitializeEffect on the same held object: same instance, StartEffect is NOT
+	// re-run, OnInitialEffectApplied does NOT re-fire, no operation is created. Runs on
+	// every machine — client and server both compute the update from the same flow.
+	if (UGMCAbilityEffect* Live = FindActiveEffectByClass(EffectClass))
+	{
+		// Copy (not reference) — we overwrite Live->EffectData below.
+		const FGMCAbilityEffectData Current = Live->EffectData;
+		FGMCAbilityEffectData Updated = InitializationData;
+
+		// Identity, lifecycle and grant bookkeeping are locked at application time:
+		// StartEffect already processed the grants and EndEffect must remove exactly
+		// what was added; the timing fields anchor the effect on both machines.
+		Updated.OwnerAbilityComponent          = Current.OwnerAbilityComponent;
+		Updated.EffectID                       = Current.EffectID;
+		Updated.bServerAuth                    = Current.bServerAuth;
+		Updated.bClientAuth                    = Current.bClientAuth;
+		Updated.StartTime                      = Current.StartTime;
+		Updated.EndTime                        = Current.EndTime;
+		Updated.CurrentDuration                = Current.CurrentDuration;
+		Updated.EffectType                     = Current.EffectType;
+		Updated.Delay                          = Current.Delay;
+		Updated.Duration                       = Current.Duration;
+		Updated.EffectTag                      = Current.EffectTag;
+		Updated.GrantedTags                    = Current.GrantedTags;
+		Updated.GrantedAbilities               = Current.GrantedAbilities;
+		Updated.bPreserveGrantedTagsIfMultiple = Current.bPreserveGrantedTagsIfMultiple;
+		Updated.bUniqueByEffectTag             = Current.bUniqueByEffectTag;
+		Updated.bNegateEffectAtEnd             = Current.bNegateEffectAtEnd;
+
+		Live->EffectData = Updated;
+
+		PendingQueuedEffectsByClass.Remove(EffectClass);
+		OutEffectId = Current.EffectID;
+		return true;
+	}
+
+	// 2) In flight: the first call's operation hasn't applied yet — coalesce. Entries
+	// outlive their usefulness after QueuedEffectPendingWindow (operation rejected or
+	// the effect already ended between calls); then a fresh application is allowed.
+	if (const FGMASPendingQueuedEffect* Pending = PendingQueuedEffectsByClass.Find(EffectClass))
+	{
+		if (ActionTimer - Pending->QueuedAtActionTimer < QueuedEffectPendingWindow)
+		{
+			OutEffectId = Pending->EffectId;
+			return true;
+		}
+		PendingQueuedEffectsByClass.Remove(EffectClass);
+	}
+
+	// 3) First application — exactly the standard ApplyAbilityEffect ServerAuth path.
+	// Non-authority machines never originate: the server's bound operation applies the
+	// effect on both sides, after which calls land in the live-update branch above.
+	if (!IsAuthorityForGMASLogic())
+	{
+		return false;
+	}
+
+	bool bSuccess = false;
+	int EffectHandle = -1;
+	int EffectId = -1;
+	UGMCAbilityEffect* AppliedEffect = nullptr;
+	ApplyAbilityEffectSafe(EffectClass, InitializationData, EGMCAbilityEffectQueueType::ServerAuth,
+		bSuccess, EffectHandle, EffectId, AppliedEffect, nullptr);
+	if (!bSuccess)
+	{
+		return false;
+	}
+
+	FGMASPendingQueuedEffect Pending;
+	Pending.EffectId = EffectId;
+	Pending.QueuedAtActionTimer = ActionTimer;
+	PendingQueuedEffectsByClass.Add(EffectClass, Pending);
+
+	OutEffectId = EffectId;
+	return true;
+}
+
+
 void UGMC_AbilitySystemComponent::ApplyAbilityEffectSafe(TSubclassOf<UGMCAbilityEffect> EffectClass,
                                                          FGMCAbilityEffectData InitializationData, EGMCAbilityEffectQueueType QueueType, bool& OutSuccess, int& OutEffectHandle, int& OutEffectId,
                                                          UGMCAbilityEffect*& OutEffect, UGMCAbility* HandlingAbility)
