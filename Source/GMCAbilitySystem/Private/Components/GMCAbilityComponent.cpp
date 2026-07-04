@@ -3204,8 +3204,10 @@ bool UGMC_AbilitySystemComponent::ApplyAbilityEffect(TSubclassOf<UGMCAbilityEffe
 	case EGMCAbilityEffectQueueType::ServerAuthMove:
 	case EGMCAbilityEffectQueueType::ServerAuth:
 		{
-			// Client does not apply effects in these queues, only the server does
-			if (!HasAuthority())
+			// Client does not apply effects in these queues, only the server does.
+			// IsAuthorityForGMASLogic == HasAuthority in production; it additionally honors
+			// bForceAuthorityForTest so the headless harness can exercise this branch.
+			if (!IsAuthorityForGMASLogic())
 			{
 				return false;
 			}

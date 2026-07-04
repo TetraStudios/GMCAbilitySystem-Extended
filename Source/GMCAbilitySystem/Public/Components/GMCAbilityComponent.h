@@ -1238,6 +1238,13 @@ public:
 		ServerProcessOperation(OperationData, bFromMovementTick);
 	}
 
+	// Test seam for ProcessEffectApplicationFromOperation (private). Lets specs dispatch a
+	// queued ApplyEffect payload the way the GMC move pipeline does on client and server.
+	void ProcessEffectApplicationFromOperationForTest(const FGMASBoundQueueV2ApplyEffectOperation& Data)
+	{
+		ProcessEffectApplicationFromOperation(Data);
+	}
+
 	// Test seam for the HasAuthority() guard in ServerProcessOperation. Orphan components
 	// in the headless harness always report HasAuthority()==false; setting this flag forces
 	// IsAuthorityForGMASLogic() to return true so server-side dispatch paths can be exercised.

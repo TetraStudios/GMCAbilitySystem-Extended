@@ -266,6 +266,26 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem")
 	void InitializeEffect(FGMCAbilityEffectData InitializationData);
 
+	// Op-queued counterpart of InitializeEffect. InitializeEffect applies inline at each
+	// machine's local ActionTimer, so a Blueprint flow that runs it on both client and server
+	// (e.g. loadout gain effects) applies at different move times on each side — the source of
+	// granted-tag/attribute corrections under latency. This variant instead resolves the target
+	// component (OwnerAbilityComponent, falling back to SourceAbilityComponent, exactly like
+	// InitializeEffect) and delegates to ApplyAbilityEffectSafe with the ServerAuth queue type:
+	// the authority queues a bound ApplyEffect operation carrying this effect's class +
+	// InitializationData and a server-reserved EffectID, and both machines execute that same
+	// operation through the GMC move pipeline. All queueing/dispatch behavior is inherited from
+	// ApplyAbilityEffect — this function adds no path of its own.
+	// Never mutates this instance, so it is safe to call on a class-default object (the common
+	// Blueprint pattern of holding a GAE_* effect reference).
+	// Non-authority calls are intentional no-ops returning false: keep running your update flow
+	// on both machines — only the server's call queues, and the queued operation applies the
+	// effect on both sides symmetrically.
+	// Returns true if the operation was queued; OutEffectId then holds the reserved effect id
+	// (usable with RemoveEffectByIdSafe).
+	UFUNCTION(BlueprintCallable, Category = "GMCAbilitySystem", DisplayName = "Initialize Effect (Op-Queued)")
+	bool InitializeEffectQueued(FGMCAbilityEffectData InitializationData, int32& OutEffectId);
+
 
 	/**
 	 * Called when an attribute modifier is applied.

@@ -445,6 +445,177 @@ void FGMASEffectSpec::Define()
 			TagGrantor->RemoveFromRoot(); Allowed->RemoveFromRoot();
 		});
 	});
+
+	// ── InitializeEffectQueued (op-queued initialize) ───────────────────────────
+	// Drop-in counterpart of InitializeEffect with the same call shape (target =
+	// effect object/CDO + EffectData) that routes through ApplyAbilityEffectSafe's
+	// ServerAuth bound-operation queue instead of applying inline at the local
+	// ActionTimer. Contract under test:
+	//   - authority: queues one ApplyEffect operation carrying class + data +
+	//     reserved server-auth EffectID; nothing applies inline
+	//   - the effect object itself is never mutated (CDO-safe)
+	//   - non-authority: no-op returning false (the server's op applies on both sides)
+	//   - Owner→Source resolution identical to InitializeEffect
+	//   - dispatching the queued op applies the passed-through data, idempotently
+	Describe("InitializeEffectQueued", [this]()
+	{
+		It("queues a ServerAuth apply operation on authority without applying inline", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			FGMCAbilityEffectData Data;
+			Data.EffectType = EGMASEffectType::Persistent;
+			Data.OwnerAbilityComponent = AbilityComp;
+			Data.Modifiers.Add(MakeHealthMod(25.f));
+
+			int32 EffectId = 0;
+			const bool bQueued = GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, EffectId);
+
+			TestTrue("Queue call reports success on authority", bQueued);
+			TestTrue("EffectId is in the server-auth reserved range",
+				EffectId >= UGMC_AbilitySystemComponent::ServerAuthEffectIDOffset &&
+				EffectId <  UGMC_AbilitySystemComponent::ClientAuthEffectIDOffset);
+			TestTrue("No inline apply - ActiveEffects still empty", AbilityComp->GetActiveEffects().IsEmpty());
+
+			TArray<int> QueuedIDs;
+			AbilityComp->GetBoundQueueV2ForTest().ServerQueuedBoundOperationsGracePeriods.GetKeys(QueuedIDs);
+			TestEqual("Exactly one server operation queued", QueuedIDs.Num(), 1);
+			if (QueuedIDs.Num() != 1) { return; }
+
+			const FInstancedStruct Payload = AbilityComp->GetBoundQueueV2ForTest().GetPayloadByID(QueuedIDs[0]);
+			TestTrue("Queued payload is an ApplyEffect operation",
+				Payload.GetScriptStruct() == FGMASBoundQueueV2ApplyEffectOperation::StaticStruct());
+			if (Payload.GetScriptStruct() != FGMASBoundQueueV2ApplyEffectOperation::StaticStruct()) { return; }
+
+			const FGMASBoundQueueV2ApplyEffectOperation& Op = Payload.Get<FGMASBoundQueueV2ApplyEffectOperation>();
+			TestTrue ("Operation carries the effect class", Op.EffectClass == UGMCAbilityEffect::StaticClass());
+			TestEqual("Operation carries the reserved effect id", Op.EffectID, static_cast<int>(EffectId));
+			TestEqual("Operation carries the caller's modifiers", Op.EffectData.Modifiers.Num(), 1);
+			if (Op.EffectData.Modifiers.Num() == 1)
+			{
+				TestEqual("Modifier value passed through", Op.EffectData.Modifiers[0].ModifierValue, 25.f);
+			}
+		});
+
+		It("never mutates the effect object it is called on (CDO-safe)", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			UGMCAbilityEffect* CDO = GetMutableDefault<UGMCAbilityEffect>();
+			const int32 StateBefore     = static_cast<int32>(CDO->CurrentState);
+			const int   ModifiersBefore = CDO->EffectData.Modifiers.Num();
+			const int   EffectIDBefore  = CDO->EffectData.EffectID;
+
+			FGMCAbilityEffectData Data;
+			Data.EffectType = EGMASEffectType::Persistent;
+			Data.OwnerAbilityComponent = AbilityComp;
+			Data.GrantedTags.AddTag(BurningTag);
+			Data.Modifiers.Add(MakeHealthMod(-10.f));
+
+			int32 EffectId = 0;
+			CDO->InitializeEffectQueued(Data, EffectId);
+
+			TestEqual("CurrentState untouched", static_cast<int32>(CDO->CurrentState), StateBefore);
+			TestEqual("CDO modifiers untouched", CDO->EffectData.Modifiers.Num(), ModifiersBefore);
+			TestEqual("CDO EffectID untouched", CDO->EffectData.EffectID, EffectIDBefore);
+			TestTrue ("CDO granted tags untouched", CDO->EffectData.GrantedTags.IsEmpty());
+		});
+
+		It("is a no-op returning false on non-authority", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			// bForceAuthorityForTest stays false; orphan components report
+			// HasAuthority()==false, matching a client machine. The server's queued
+			// op is what applies the effect on both sides.
+
+			FGMCAbilityEffectData Data;
+			Data.EffectType = EGMASEffectType::Persistent;
+			Data.OwnerAbilityComponent = AbilityComp;
+			Data.Modifiers.Add(MakeHealthMod(25.f));
+
+			int32 EffectId = 0;
+			const bool bQueued = GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, EffectId);
+
+			TestFalse("Non-authority call reports false", bQueued);
+			TestEqual("No effect id allocated", EffectId, -1);
+			TestEqual("Nothing queued", AbilityComp->GetBoundQueueV2ForTest().GetPayloadCount(), 0);
+			TestTrue ("Nothing applied", AbilityComp->GetActiveEffects().IsEmpty());
+		});
+
+		It("refuses and queues nothing when Owner and Source are both null", [this]()
+		{
+			AddExpectedError(TEXT("both null"), EAutomationExpectedErrorFlags::Contains, 1);
+
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			FGMCAbilityEffectData Data;
+			Data.Modifiers.Add(MakeHealthMod(25.f));
+
+			int32 EffectId = 0;
+			const bool bQueued = GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, EffectId);
+
+			TestFalse("Call reports false", bQueued);
+			TestEqual("Nothing queued", AbilityComp->GetBoundQueueV2ForTest().GetPayloadCount(), 0);
+		});
+
+		It("falls back to SourceAbilityComponent when Owner is unset, like InitializeEffect", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			FGMCAbilityEffectData Data;
+			Data.EffectType = EGMASEffectType::Persistent;
+			Data.SourceAbilityComponent = AbilityComp;
+			Data.Modifiers.Add(MakeHealthMod(25.f));
+
+			int32 EffectId = 0;
+			const bool bQueued = GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, EffectId);
+
+			TestTrue ("Queue call succeeds via Source fallback", bQueued);
+			TestEqual("One server operation queued",
+				AbilityComp->GetBoundQueueV2ForTest().ServerQueuedBoundOperationsGracePeriods.Num(), 1);
+		});
+
+		It("applies passed-through data on dispatch, idempotent on re-dispatch", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			FGMCAbilityEffectData Data;
+			Data.EffectType = EGMASEffectType::Persistent;
+			Data.Duration   = 0.f;
+			Data.OwnerAbilityComponent = AbilityComp;
+			Data.GrantedTags.AddTag(BurningTag);
+
+			int32 EffectId = 0;
+			const bool bQueued = GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, EffectId);
+			TestTrue("Queue call succeeds", bQueued);
+
+			TArray<int> QueuedIDs;
+			AbilityComp->GetBoundQueueV2ForTest().ServerQueuedBoundOperationsGracePeriods.GetKeys(QueuedIDs);
+			if (QueuedIDs.Num() != 1) { AddError(TEXT("Expected exactly one queued operation")); return; }
+			const FInstancedStruct Payload = AbilityComp->GetBoundQueueV2ForTest().GetPayloadByID(QueuedIDs[0]);
+			if (Payload.GetScriptStruct() != FGMASBoundQueueV2ApplyEffectOperation::StaticStruct())
+			{
+				AddError(TEXT("Expected an ApplyEffect operation payload"));
+				return;
+			}
+
+			// Dispatch the op the way the GMC move pipeline does on each machine.
+			AbilityComp->ProcessEffectApplicationFromOperationForTest(Payload.Get<FGMASBoundQueueV2ApplyEffectOperation>());
+			AbilityComp->GenPredictionTick(1.f);
+
+			TestTrue("Effect active under the reserved id", AbilityComp->GetActiveEffects().Contains(EffectId));
+			TestTrue("Granted tag applied", AbilityComp->HasActiveTag(BurningTag));
+
+			// Replay / duplicate delivery must not create a second instance.
+			AbilityComp->ProcessEffectApplicationFromOperationForTest(Payload.Get<FGMASBoundQueueV2ApplyEffectOperation>());
+			TestEqual("Re-dispatch is idempotent", AbilityComp->GetActiveEffects().Num(), 1);
+		});
+	});
 }
 
 #endif // WITH_AUTOMATION_WORKER

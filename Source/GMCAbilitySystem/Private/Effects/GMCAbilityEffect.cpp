@@ -85,6 +85,55 @@ void UGMCAbilityEffect::InitializeEffect(FGMCAbilityEffectData InitializationDat
 }
 
 
+bool UGMCAbilityEffect::InitializeEffectQueued(FGMCAbilityEffectData InitializationData, int32& OutEffectId)
+{
+	OutEffectId = -1;
+
+	// Same component resolution as InitializeEffect: Owner first, Source fallback.
+	UGMC_AbilitySystemComponent* ResolvedOwner = InitializationData.OwnerAbilityComponent;
+	if (ResolvedOwner == nullptr)
+	{
+		ResolvedOwner = InitializationData.SourceAbilityComponent;
+	}
+	if (ResolvedOwner == nullptr)
+	{
+		UE_LOG(LogGMCAbilitySystem, Error,
+			TEXT("UGMCAbilityEffect::InitializeEffectQueued (%s): OwnerAbilityComponent and "
+			     "SourceAbilityComponent are both null — nothing queued."),
+			*GetName());
+		return false;
+	}
+
+	// Non-authority: intentional no-op. The BP flow runs on both machines; only the
+	// server's call queues, and the queued operation applies the effect on both sides
+	// at the same point in the GMC move pipeline.
+	if (!ResolvedOwner->IsAuthorityForGMASLogic())
+	{
+		UE_LOG(LogGMCAbilitySystem, Verbose,
+			TEXT("UGMCAbilityEffect::InitializeEffectQueued (%s): non-authority call ignored — "
+			     "the server's queued operation applies on both machines."),
+			*GetName());
+		return false;
+	}
+
+	// Everything below is the standard ApplyAbilityEffect ServerAuth path — this function
+	// deliberately adds no queueing/dispatch logic of its own so future changes to
+	// ApplyAbilityEffect are inherited without touching this wrapper.
+	bool bSuccess = false;
+	int EffectHandle = -1;
+	int EffectId = -1;
+	UGMCAbilityEffect* AppliedEffect = nullptr;
+	ResolvedOwner->ApplyAbilityEffectSafe(GetClass(), InitializationData,
+		EGMCAbilityEffectQueueType::ServerAuth, bSuccess, EffectHandle, EffectId, AppliedEffect, nullptr);
+
+	if (bSuccess)
+	{
+		OutEffectId = EffectId;
+	}
+	return bSuccess;
+}
+
+
 void UGMCAbilityEffect::StartEffect()
 {
 	bHasStarted = true;
