@@ -1296,6 +1296,13 @@ public:
 		ProcessEffectApplicationFromOperation(Data);
 	}
 
+	// Test seam for ProcessOperation (private). Lets specs exercise the batch dispatch
+	// path (and other op branches) without the GMC move pipeline.
+	bool ProcessOperationForTest(const FInstancedStruct& OperationData, bool bFromMovementTick, bool bForce)
+	{
+		return ProcessOperation(OperationData, bFromMovementTick, bForce);
+	}
+
 	// Test seam for the HasAuthority() guard in ServerProcessOperation. Orphan components
 	// in the headless harness always report HasAuthority()==false; setting this flag forces
 	// IsAuthorityForGMASLogic() to return true so server-side dispatch paths can be exercised.

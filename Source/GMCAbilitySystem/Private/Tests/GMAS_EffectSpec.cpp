@@ -19,6 +19,7 @@
 #include "Effects/GMCAbilityEffect.h"
 #include "Attributes/GMCAttributeModifier.h"
 #include "UGMAS_TestMovementCmp.h"
+#include "UGMAS_TestEffectListener.h"
 
 #if WITH_AUTOMATION_WORKER
 
@@ -761,6 +762,72 @@ void FGMASEffectSpec::Define()
 			TestTrue ("Post-window call queues again", GetMutableDefault<UGMCAbilityEffect>()->InitializeEffectQueued(Data, Id2));
 			TestEqual("A second server operation now exists",
 				AbilityComp->GetBoundQueueV2ForTest().ServerQueuedBoundOperationsGracePeriods.Num(), 2);
+		});
+	});
+
+	// ── EXPERIMENTAL (2026-07-04): apply-ordering + batch-noise fixes ───────────
+	// Observed in the 300ms/10% lag test: OnInitialEffectApplied broadcasts BEFORE the
+	// effect is registered in ActiveEffects, so a handler that re-enters the coalescing
+	// apply-or-update cannot see the applying instance and queues a duplicate logical
+	// application (double GAE_*Gain at loadout). And the authority's batch pass logged
+	// Error for sub-op payloads its own ack path had already consumed — pure noise.
+	Describe("Experimental apply ordering", [this]()
+	{
+		It("broadcasts OnInitialEffectApplied with the effect already registered; re-entrant coalescing lands on it", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			UGMAS_TestEffectListener* Listener = NewObject<UGMAS_TestEffectListener>(GetTransientPackage());
+			Listener->AddToRoot();
+			Listener->Comp = AbilityComp;
+			AbilityComp->OnInitialEffectApplied.AddDynamic(Listener, &UGMAS_TestEffectListener::OnInitialApply);
+
+			UGMCAbilityEffect* Effect = NewObject<UGMCAbilityEffect>(GetTransientPackage());
+			Effect->AddToRoot();
+
+			FGMCAbilityEffectData Data;
+			Data.EffectType = EGMASEffectType::Persistent;
+			Data.Duration   = 0.f;
+			Data.Modifiers.Add(MakeHealthMod(25.f));
+
+			UGMCAbilityEffect* Applied = AbilityComp->ApplyAbilityEffect(Effect, Data);
+			TestNotNull("Apply returned the effect", Applied);
+
+			TestEqual("Initial-apply broadcast fired exactly once", Listener->BroadcastCount, 1);
+			TestTrue ("Effect was already in ActiveEffects when the broadcast fired", Listener->bRegisteredAtBroadcast);
+			TestTrue ("Re-entrant coalescing call succeeded", Listener->bReentrantCallSucceeded);
+			if (Applied)
+			{
+				TestEqual("Re-entrant call landed on the applying instance",
+					Listener->ReentrantOutId, Applied->EffectData.EffectID);
+			}
+			TestEqual("Re-entrant call queued no duplicate application",
+				AbilityComp->GetBoundQueueV2ForTest().GetPayloadCount(), 0);
+			TestEqual("Exactly one live instance", AbilityComp->GetActiveEffects().Num(), 1);
+
+			AbilityComp->OnInitialEffectApplied.RemoveDynamic(Listener, &UGMAS_TestEffectListener::OnInitialApply);
+			Listener->RemoveFromRoot();
+			Effect->RemoveFromRoot();
+		});
+
+		It("authority batch pass stays quiet for sub-operation payloads already consumed by the ack path", [this]()
+		{
+			AbilityComp->ActionTimer = 1.0;
+			AbilityComp->bForceAuthorityForTest = true;
+
+			// Post-ack state: the batch references sub-ops whose payloads the server's
+			// ServerProcessAcknowledgedOperation already applied and removed. The second
+			// (batch) dispatch must skip them WITHOUT error-level logging on authority.
+			// Automation fails on unexpected Error logs, so no AddExpectedError here IS
+			// the assertion.
+			FGMASBoundQueueV2BatchOperation Batch;
+			Batch.OperationID = 999;
+			Batch.SubOperationIDs = { 41, 42 };
+
+			AbilityComp->ProcessOperationForTest(FInstancedStruct::Make(Batch), false, true);
+
+			TestEqual("Nothing applied from consumed sub-ops", AbilityComp->GetActiveEffects().Num(), 0);
 		});
 	});
 }

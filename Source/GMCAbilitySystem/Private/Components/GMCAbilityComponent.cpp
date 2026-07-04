@@ -2282,20 +2282,30 @@ bool UGMC_AbilitySystemComponent::ProcessOperation(FInstancedStruct OperationDat
 		{
 			if (!BoundQueueV2.HasPayloadByID(SubID))
 			{
-				// A sub-operation whose payload is missing from the cache (expired, never
-				// delivered) cannot be applied on this side. This used to be a SILENT skip:
-				// the batch still reported success, the op landed on the other side only,
-				// and the resulting state divergence had no trace anywhere. Keep skipping
-				// (nothing to apply) and keep it OUT of the ack list — so the server's
-				// grace-timeout drain still has a chance to force it — but log it loudly.
-				UE_LOG(LogGMCAbilitySystem, Error,
-					TEXT("[BatchOp] Sub-operation %d payload missing from cache — NOT applied on this side (batch of %d sub-ops, Authority=%d, Replaying=%d)."),
-					SubID, Batch.SubOperationIDs.Num(), HasAuthority() ? 1 : 0, IsReplayingForGMASLogic() ? 1 : 0);
-				if (HasAuthority())
+				// A sub-operation whose payload is missing from the cache cannot be applied
+				// on this side. Keep skipping (nothing to apply) and keep it OUT of the ack
+				// list — so the server's grace-timeout drain still has a chance to force it.
+				//
+				// EXPERIMENTAL (2026-07-04): severity split by role. On the AUTHORITY this
+				// is the normal idempotent second dispatch — ServerProcessAcknowledgedOperation
+				// already applied the sub-op and removed its payload ("server only ever
+				// processes operations once"), so the batch pass finding it gone is expected:
+				// log Verbose. (Rare true loss on the server — a never-processed op expired
+				// from the cache — is also covered by the grace-timeout force path.) On
+				// CLIENTS a missing payload is real trouble (RPC loss/ordering; the op only
+				// lands via the server's grace-timeout force) — keep Error. To revert:
+				// restore the unconditional Error + the LogTemp authority duplicate.
+				if (IsAuthorityForGMASLogic())
 				{
-					UE_LOG(LogTemp, Error,
-						TEXT("[BatchOp] Sub-operation %d payload missing from cache — NOT applied on this side (batch of %d sub-ops)."),
+					UE_LOG(LogGMCAbilitySystem, Verbose,
+						TEXT("[BatchOp] Sub-operation %d payload already consumed (ack path) — batch pass skip (batch of %d sub-ops)."),
 						SubID, Batch.SubOperationIDs.Num());
+				}
+				else
+				{
+					UE_LOG(LogGMCAbilitySystem, Error,
+						TEXT("[BatchOp] Sub-operation %d payload missing from cache — NOT applied on this side (batch of %d sub-ops, Authority=0, Replaying=%d)."),
+						SubID, Batch.SubOperationIDs.Num(), IsReplayingForGMASLogic() ? 1 : 0);
 				}
 				continue;
 			}
@@ -3545,27 +3555,37 @@ UGMCAbilityEffect* UGMC_AbilitySystemComponent::ApplyAbilityEffect(UGMCAbilityEf
 	InitializationData.OwnerAbilityComponent = this;
 	InitializationData.SourceAbilityComponent = this;
 
-	Effect->InitializeEffect(InitializationData);
-	
-	if (Effect->EffectData.EffectID == 0)
+	// EXPERIMENTAL (2026-07-04): resolve the EffectID and register the effect BEFORE
+	// InitializeEffect runs. StartEffect broadcasts OnEffectApplied/OnInitialEffectApplied
+	// mid-initialization; with registration after the fact, re-entrant queries from those
+	// handlers (GetActiveEffects, FindActiveEffectByClass, QueueOrUpdateEffectByClass)
+	// could not see the applying instance and queued a duplicate logical application
+	// (observed: double GAE_*Gain at loadout in the 300ms/10% lag test). The ID is
+	// written into InitializationData so InitializeEffect's wholesale EffectData
+	// assignment preserves it — this replaces the former post-init "EffectID == 0"
+	// fallback. To revert: move this block back below InitializeEffect and restore the
+	// post-init ID fallback.
+	if (InitializationData.EffectID == 0)
 	{
-		Effect->EffectData.EffectID = GetNextAvailableEffectID();
+		InitializationData.EffectID = GetNextAvailableEffectID();
 	}
 
 	if (HasAuthority())
 	{
 		// If this was a server-auth, the ID is already generated and needs to be cleaned up from reserved
-		ReservedEffectIDs.Remove(Effect->EffectData.EffectID);
+		ReservedEffectIDs.Remove(InitializationData.EffectID);
 	}
 	else
 	{
-		ProcessedEffectIDs.Add(Effect->EffectData.EffectID, EGMCEffectAnswerState::Pending);
+		ProcessedEffectIDs.Add(InitializationData.EffectID, EGMCEffectAnswerState::Pending);
 	}
 
-	ActiveEffects.Add(Effect->EffectData.EffectID, Effect);
+	ActiveEffects.Add(InitializationData.EffectID, Effect);
 
 	// Both sides write deterministically; server's value overwrites client on replication.
-	BoundActiveEffectIDs_Add(Effect->EffectData.EffectID);
+	BoundActiveEffectIDs_Add(InitializationData.EffectID);
+
+	Effect->InitializeEffect(InitializationData);
 
 	// Replace deferred same-tag matches. Server force-ends immediately (authoritative);
 	// client suspends the OLD pending the successor's Validated/Timeout verdict so a
