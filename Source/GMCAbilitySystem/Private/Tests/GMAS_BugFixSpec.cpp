@@ -11,6 +11,7 @@
 #include "UGMAS_TestMovementCmp.h"
 #include "UGMAS_TestAbility.h"
 #include "UGMAS_TestCostEffect.h"
+#include "UGMAS_TestEffectListener.h"
 
 #if WITH_AUTOMATION_WORKER
 
@@ -1962,6 +1963,67 @@ void FGMASBugFixSpec::Define()
 				AbilityComp->GetBoundQueueV2ForTest().OperationData.GetScriptStruct() == FGMASBoundQueueV2BatchOperation::StaticStruct());
 			TestEqual("Single-slot fallback pops one op, leaves the other in queue",
 				AbilityComp->GetBoundQueueV2ForTest().ClientQueuedOperations.Num(), 1);
+		});
+	});
+
+	// ── ProcessEffectApplicationFromOperation re-entrant untrack (FindChecked crash) ──
+	// Regression for: "Assertion failed: Pair != nullptr [Map.h.inl:648]" in
+	// TMapBase<int,EGMCEffectAnswerState>::FindChecked(), from
+	// ProcessEffectApplicationFromOperation (GenPredictionTick -> ProcessOperation, client).
+	// On a non-authority client, ApplyAbilityEffect adds the EffectID to ProcessedEffectIDs
+	// as Pending, then runs InitializeEffect -> StartEffect, which broadcasts OnEffectApplied.
+	// A BP/tag listener firing on that broadcast can re-enter the ASC and remove the entry
+	// before control returns to the auto-validate write. The old code used operator[] (==
+	// FindChecked) and asserted; the fix guards with Find() (skip when absent -> no crash,
+	// no orphan). Orphan components in this harness report HasAuthority()==false, so the
+	// non-authority auto-validate branch is exercised directly.
+	Describe("ProcessEffectApplicationFromOperation re-entrant untrack", [this]()
+	{
+		It("does not FindChecked-assert when a re-entrant apply handler drops the entry, and re-adds no orphan", [this]()
+		{
+			UGMAS_TestEffectListener* Listener = NewObject<UGMAS_TestEffectListener>(GetTransientPackage());
+			Listener->Comp = AbilityComp;
+			Listener->AddToRoot();
+
+			// Untrack the effect mid-apply (fires inside ApplyAbilityEffect, before line 2612).
+			AbilityComp->OnEffectApplied.AddDynamic(Listener, &UGMAS_TestEffectListener::OnApplied_UntrackProcessedEntry);
+
+			const int EffectID = 4242;
+			FGMASBoundQueueV2ApplyEffectOperation Op;
+			Op.EffectClass = UGMCAbilityEffect::StaticClass();
+			Op.EffectID    = EffectID;
+
+			// Pre-fix this call aborts the process on the FindChecked assertion.
+			AbilityComp->ProcessEffectApplicationFromOperationForTest(Op);
+
+			// The apply path actually ran (broadcast fired) — guards against a false pass
+			// where the effect never applied and line 2612 was never reached.
+			TestTrue("Re-entrant untrack handler fired (apply path exercised)",
+				Listener->UntrackCallCount > 0);
+			TestTrue("Effect was applied (present in ActiveEffects)",
+				AbilityComp->GetActiveEffects().Contains(EffectID));
+			// Find()-guard must NOT resurrect a ProcessedEffectIDs entry the handler removed
+			// (an orphan with no ActiveEffects row would never be reaped — the .Add() bug).
+			TestFalse("No orphan ProcessedEffectIDs entry re-added for the untracked effect",
+				AbilityComp->GetProcessedEffectIDsForTest().Contains(EffectID));
+
+			AbilityComp->OnEffectApplied.RemoveDynamic(Listener, &UGMAS_TestEffectListener::OnApplied_UntrackProcessedEntry);
+			Listener->RemoveFromRoot();
+		});
+
+		It("promotes the entry to Validated on the normal path (no re-entrant removal)", [this]()
+		{
+			const int EffectID = 4243;
+			FGMASBoundQueueV2ApplyEffectOperation Op;
+			Op.EffectClass = UGMCAbilityEffect::StaticClass();
+			Op.EffectID    = EffectID;
+
+			AbilityComp->ProcessEffectApplicationFromOperationForTest(Op);
+
+			// Entry was added Pending by ApplyAbilityEffect, then promoted here.
+			TestEqual("Server-sourced effect auto-validated",
+				static_cast<int>(AbilityComp->GetProcessedEffectIDsForTest().FindRef(EffectID)),
+				static_cast<int>(EGMCEffectAnswerState::Validated));
 		});
 	});
 }

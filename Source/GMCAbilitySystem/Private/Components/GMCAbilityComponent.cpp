@@ -1749,7 +1749,14 @@ void UGMC_AbilitySystemComponent::RPCClientEndAbility_Implementation(int Ability
 				TEXT("[AbilityCut] Server force-ended ability that was still active locally. %s"),
 				*LocalAbility->GetAbilityCutDiagnostics());
 		}
-		ActiveAbilities[AbilityID]->EndAbility();
+		// Use the cached pointer instead of re-indexing ActiveAbilities[AbilityID]:
+		// operator[] is FindChecked (asserts on a missing key), and the diagnostics call
+		// above is a callback surface that could in principle re-enter and drop the entry.
+		// The null-guard also covers a null map value the old bare deref would have crashed on.
+		if (LocalAbility)
+		{
+			LocalAbility->EndAbility();
+		}
 		UE_LOG(LogGMCAbilitySystem, VeryVerbose, TEXT("[RPC] Server Ended Ability: %d"), AbilityID);
 	}
 }
@@ -2606,11 +2613,26 @@ void UGMC_AbilitySystemComponent::ProcessEffectApplicationFromOperation(const FG
 		ApplyAbilityEffect(Data.EffectClass, DefaultData, EGMCAbilityEffectQueueType::Predicted, OutEffectHandle, OutEffectId, Effect);
 	}
 
-	// Auto validate the effect since this was added via a server operation
+	// Auto validate the effect since this was added via a server operation.
+	//
+	// Guard the write with Find() instead of operator[] (== FindChecked, which asserts
+	// Pair != nullptr on a missing key): ApplyAbilityEffect above runs
+	// Effect->InitializeEffect() -> StartEffect(), which for instant effects calls
+	// EndEffect() and broadcasts OnEffectApplied/OnEffectRemoved plus runs the
+	// ApplyEffectOnEnd/RemoveEffectOnEnd chain hooks. Any of those can re-enter the ASC via
+	// BP handlers or gameplay-tag listeners and remove this EffectID's ProcessedEffectIDs
+	// entry (added as Pending in ApplyAbilityEffect) before control returns here. This is the
+	// same re-entrancy TickActiveEffects already guards against with Find()+skip. If the entry
+	// is gone the effect has already ended (ProcessedEffectIDs.Remove only ever runs paired
+	// with ActiveEffects.Remove), so there is nothing to validate; re-adding it would orphan a
+	// ProcessedEffectIDs entry with no ActiveEffects row that the sweep never reaps.
 	if (!HasAuthority() && Effect != nullptr)
 	{
-		ProcessedEffectIDs[Effect->EffectData.EffectID] = EGMCEffectAnswerState::Validated;
-		UE_LOG(LogGMCAbilitySystem, VeryVerbose, TEXT("Applied Effect: %s"), *GetNameSafe(Data.EffectClass));
+		if (EGMCEffectAnswerState* State = ProcessedEffectIDs.Find(Effect->EffectData.EffectID))
+		{
+			*State = EGMCEffectAnswerState::Validated;
+			UE_LOG(LogGMCAbilitySystem, VeryVerbose, TEXT("Applied Effect: %s"), *GetNameSafe(Data.EffectClass));
+		}
 	}
 }
 
