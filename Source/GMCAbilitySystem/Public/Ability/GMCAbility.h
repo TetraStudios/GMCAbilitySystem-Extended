@@ -347,12 +347,15 @@ private:
 	UPROPERTY()
 	TArray<TObjectPtr<UGameplayTask>> ActiveTasks;
 
-	UPROPERTY()
-	UGMCAbilityEffect* AbilityCostInstance = nullptr;
+
 
 	bool IsOnCooldown() const;
 
 public:
+
+	UPROPERTY(BlueprintReadWrite, Category = "GMCAbilitySystem")
+	UGMCAbilityEffect* AbilityCostInstance = nullptr;
+
 	FString ToString() const{
 		return FString::Printf(TEXT("[name: %s] [Tag %s] (%s) | NumTasks %d"), *GetName().Left(30), *AbilityTag.ToString(), *EnumToString(AbilityState), RunningTasks.Num());
 	}
