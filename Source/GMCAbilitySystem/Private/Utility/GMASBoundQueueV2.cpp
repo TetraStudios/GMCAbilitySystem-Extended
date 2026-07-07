@@ -171,13 +171,19 @@ void FGMASBoundQueueV2::GenAncillaryTick(const float DeltaTime)
 	{
 		It.Value() -= DeltaTime;
 		
-		if (It.Value() <= 0) 
+		if (It.Value() <= 0)
 		{
 			if (OperationPayloads.Contains(It.Key()))
 			{
 				OnServerOperationForced.Broadcast(OperationPayloads[It.Key()]);
 				OperationPayloads.Remove(It.Key());
 			}
+			// A Client RPC that self-executed on the server (actor with no owning
+			// connection) strands the op ID in the server's ClientQueuedOperations,
+			// where nothing ever drains it — CheckValidState() would then error
+			// every tick forever. The op is resolved either way once forced, so
+			// drop the stale ID.
+			ClientQueuedOperations.Remove(It.Key());
 			It.RemoveCurrent();
 		}
 	}

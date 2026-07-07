@@ -777,6 +777,19 @@ bool UGMC_AbilitySystemComponent::TryActivateAbility(const TSubclassOf<UGMCAbili
 	return true;
 }
 
+bool UGMC_AbilitySystemComponent::ShouldBypassServerOperationQueue(const bool bIsAuthority,
+	const bool bIsNetworkedServer, const bool bIsLocallyControlledServerPawn,
+	const bool bIsRemotelyControlledServerPawn)
+{
+	// Bypass only on a networked server's authority pawn that no machine will ever
+	// ack: not this machine (listen host / server-side AI pawns drain their own
+	// queue) and not a remote autonomous client (RPC + move-stream ack round-trip).
+	// Standalone keeps the queue path — it drains its own queue via the
+	// NM_Standalone gate in GenPreLocalMoveExecution.
+	return bIsAuthority && bIsNetworkedServer
+		&& !bIsLocallyControlledServerPawn && !bIsRemotelyControlledServerPawn;
+}
+
 void UGMC_AbilitySystemComponent::QueueAbility(FGameplayTag InputTag, const UInputAction* InputAction, bool bPreventConcurrentActivation)
 {
 	if (GetOwnerRole() != ROLE_AutonomousProxy && GetOwnerRole() != ROLE_Authority) return;
@@ -828,6 +841,25 @@ void UGMC_AbilitySystemComponent::QueueAbility(FGameplayTag InputTag, const UInp
 		// An activation operation for this input tag is already in flight (queued locally or
 		// awaiting acknowledgement): let it resolve before another may be enqueued.
 		if (GetPendingAbilityActivationCount(InputTag) > 0) return;
+	}
+
+	// Server-local activation for pawns with no viable ack round-trip (unpossessed /
+	// unowned server actors, e.g. a server-spawned ordnance pawn). For those,
+	// QueueServerOperation's Client RPC self-executes on the server (UE runs Client
+	// RPCs locally when the actor has no owning connection), stranding the op in
+	// ClientQueuedOperations where nothing on the server drains it — CheckValidState
+	// then errors every ancillary tick and the ability only fires when the grace
+	// timeout forces it. No remote twin exists to keep in sync, so activate directly
+	// with the same flags as the force path; SourceOperationID=0 makes AbilityIDs
+	// locally generated, which is safe precisely because there is no remote twin.
+	if (GMCMovementComponent && ShouldBypassServerOperationQueue(
+			HasAuthority(),
+			GMCMovementComponent->IsNetworkedServer(),
+			GMCMovementComponent->IsLocallyControlledServerPawn(),
+			GMCMovementComponent->IsRemotelyControlledServerPawn()))
+	{
+		TryActivateAbilitiesByInputTag(InputTag, InputAction, /*bFromMovementTick =*/ false, /*bForce =*/ true, /*SourceOperationID =*/ 0);
+		return;
 	}
 
 	// Existing standard flow continues unchanged below.

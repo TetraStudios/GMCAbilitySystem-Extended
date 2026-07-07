@@ -506,6 +506,19 @@ public:
 	                        bool bSkipActivationTagsCheck = false,
 	                        const int ForcedAbilityID = 0);
 
+	// Pure routing decision for QueueAbility on the authority. The server-broadcast
+	// path (QueueServerOperation -> RPCOnServerOperationAdded -> ack via the GMC move
+	// stream) is only viable when some machine's move stream will echo the op back:
+	// a remote autonomous client, a locally controlled server pawn (listen host / AI),
+	// or standalone. For any other authority pawn (unpossessed / unowned server actor)
+	// the Client RPC self-executes on the server and the op strands in
+	// ClientQueuedOperations forever — such activations must bypass the queue and run
+	// directly. Static and stateless so headless specs can pin the decision table.
+	static bool ShouldBypassServerOperationQueue(bool bIsAuthority,
+	                                             bool bIsNetworkedServer,
+	                                             bool bIsLocallyControlledServerPawn,
+	                                             bool bIsRemotelyControlledServerPawn);
+
 
 	/**
 	 * Queue an ability for activation based on the provided input tag and action.
