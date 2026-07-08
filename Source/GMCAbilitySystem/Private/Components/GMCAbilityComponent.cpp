@@ -1115,38 +1115,51 @@ void UGMC_AbilitySystemComponent::GenPredictionTick(float DeltaTime)
 	{
 		// Server processes client output payloads
 		const FGMC_PawnState OutputState = GMCMovementComponent->SV_GetLastClientData().OutputState;
-		const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
 
-		// DIAGNOSTIC: log what we're reading from client output state EACH tick
-		// when there's any non-empty struct. Catches both single Acks (OpID>0)
-		// AND BatchAcks (OpID==0 base, carries AcknowledgedIDs array).
-		const UScriptStruct* ClientStruct = ClientPayloadOperationData.GetScriptStruct();
-		if (ClientStruct && ClientStruct != FGMASBoundQueueV2OperationBaseData::StaticStruct())
+		// First-frame / unowned-pawn guard — mirrors the GenAncillaryTick twin (see the
+		// matching check ~line 275). Before the client's first move has populated
+		// SV_RemoteMoveExecutionAux.LastRawMove — or for a player-flagged but controller-less
+		// server pawn (routed here via UpdateLocallyControlledServerPawn's !Controller branch,
+		// e.g. a just-unpossessed mech) — OutputState is a default-constructed FGMC_PawnState
+		// whose InstancedStruct sync array is empty (Num()==0). The !IsLocallyControlledServerPawn
+		// guard only excludes the local host/standalone pawn, so those cases still reach this
+		// read and would assert out-of-bounds on BI_OperationData. No bound payload means there
+		// is no operation to process — skip.
+		if (OutputState.InstancedStruct.Num() > BoundQueueV2.BI_OperationData)
 		{
-			const FGMASBoundQueueV2OperationBaseData* ClientBase =
-				ClientPayloadOperationData.GetPtr<FGMASBoundQueueV2OperationBaseData>();
+			const FInstancedStruct ClientPayloadOperationData = GMCMovementComponent->GetBoundInstancedStruct(BoundQueueV2.BI_OperationData, OutputState);
 
-			FString ExtraIds;
-			if (ClientStruct == FGMASBoundQueueV2BatchAcknowledgeOperation::StaticStruct())
+			// DIAGNOSTIC: log what we're reading from client output state EACH tick
+			// when there's any non-empty struct. Catches both single Acks (OpID>0)
+			// AND BatchAcks (OpID==0 base, carries AcknowledgedIDs array).
+			const UScriptStruct* ClientStruct = ClientPayloadOperationData.GetScriptStruct();
+			if (ClientStruct && ClientStruct != FGMASBoundQueueV2OperationBaseData::StaticStruct())
 			{
-				const FGMASBoundQueueV2BatchAcknowledgeOperation* BAck =
-					ClientPayloadOperationData.GetPtr<FGMASBoundQueueV2BatchAcknowledgeOperation>();
-				if (BAck)
+				const FGMASBoundQueueV2OperationBaseData* ClientBase =
+					ClientPayloadOperationData.GetPtr<FGMASBoundQueueV2OperationBaseData>();
+
+				FString ExtraIds;
+				if (ClientStruct == FGMASBoundQueueV2BatchAcknowledgeOperation::StaticStruct())
 				{
-					ExtraIds = FString::Printf(TEXT(" batch_ids=[%s]"),
-						*FString::JoinBy(BAck->AcknowledgedIDs, TEXT(","), [](int32 ID) { return FString::Printf(TEXT("%d"), ID); }));
+					const FGMASBoundQueueV2BatchAcknowledgeOperation* BAck =
+						ClientPayloadOperationData.GetPtr<FGMASBoundQueueV2BatchAcknowledgeOperation>();
+					if (BAck)
+					{
+						ExtraIds = FString::Printf(TEXT(" batch_ids=[%s]"),
+							*FString::JoinBy(BAck->AcknowledgedIDs, TEXT(","), [](int32 ID) { return FString::Printf(TEXT("%d"), ID); }));
+					}
 				}
+
+				UE_LOG(LogGMCAbilitySystem, Warning,
+					TEXT("[AckTrace:Server:GenTick] OpData received from client output: op=%d struct=%s move_ts=%.4f%s"),
+					ClientBase ? ClientBase->OperationID : -1,
+					*ClientStruct->GetName(),
+					GMCMovementComponent->GetMoveTimestamp(),
+					*ExtraIds);
 			}
 
-			UE_LOG(LogGMCAbilitySystem, Warning,
-				TEXT("[AckTrace:Server:GenTick] OpData received from client output: op=%d struct=%s move_ts=%.4f%s"),
-				ClientBase ? ClientBase->OperationID : -1,
-				*ClientStruct->GetName(),
-				GMCMovementComponent->GetMoveTimestamp(),
-				*ExtraIds);
+			ServerProcessOperation(ClientPayloadOperationData, true);
 		}
-
-		ServerProcessOperation(ClientPayloadOperationData, true);
 	}
 	else
 	{
