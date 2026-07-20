@@ -149,6 +149,20 @@ public:
 
 	// Queue a ServerAuth operation
 	void QueueServerOperation(const int OperationID, const float Timeout = 1.0f);
+
+	// Pure routing predicate: does a machine with these properties drain its own
+	// ClientQueuedOperations in GenPreLocalMoveExecution? Static + bool-driven so
+	// automation can truth-table it (the GMC IsLocallyControlled*ServerPawn helpers
+	// are non-virtual and can't be mocked), mirroring
+	// UGMC_AbilitySystemComponent::ShouldBypassServerOperationQueue.
+	static bool WouldDrainClientQueueLocally(bool bIsClientNetMode, bool bIsStandaloneNetMode,
+		bool bIsLocallyControlledListenServerPawn, bool bIsLocallyControlledDedicatedServerPawn);
+
+	// Live-state wrapper over WouldDrainClientQueueLocally. True on machines where a
+	// queued client op legitimately exists for up to one move between queueing (e.g.
+	// QueueServerOperation's Client RPC self-executing on a standalone / listen host /
+	// server-controlled pawn) and the next GenPreLocalMoveExecution pack.
+	bool DrainsClientQueueLocally() const;
 	
 	bool CurrentOperationIsOfType(const UScriptStruct* T) const
 	{

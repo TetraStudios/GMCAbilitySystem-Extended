@@ -17,6 +17,14 @@
 //   3. The direct-activation call the bypass performs (TryActivateAbilitiesByInputTag
 //      with bForce=true, SourceOperationID=0): activates immediately from an
 //      ancillary/event context and touches no bound-queue state.
+//   4. WouldDrainClientQueueLocally — the drain-routing decision table that gates
+//      CheckValidState's pending-client-ops error: self-draining machines
+//      (standalone, listen host, server-controlled pawn) hold ops transiently by
+//      design, so only a remote-controlled server pawn may treat them as invalid.
+//   5. The transient self-drain window: an op parked by a self-executed Client RPC
+//      and awaiting the next GenPreLocalMoveExecution pack must NOT raise the
+//      CheckValidState error (the false positive that spammed standalone/listen
+//      sessions once per ability activation).
 
 #include "Misc/AutomationTest.h"
 #include "NativeGameplayTags.h"
@@ -138,6 +146,40 @@ void FGMASServerLocalActivationSpec::Define()
         });
     });
 
+    // ── Client-queue drain routing ───────────────────────────────────────────
+    Describe("WouldDrainClientQueueLocally", [this]()
+    {
+        It("drains on an autonomous client", [this]()
+        {
+            TestTrue(TEXT("NM_Client drains its own queue"),
+                FGMASBoundQueueV2::WouldDrainClientQueueLocally(true, false, false, false));
+        });
+
+        It("drains in standalone", [this]()
+        {
+            TestTrue(TEXT("NM_Standalone drains its own queue"),
+                FGMASBoundQueueV2::WouldDrainClientQueueLocally(false, true, false, false));
+        });
+
+        It("drains for a locally controlled listen-host pawn", [this]()
+        {
+            TestTrue(TEXT("Listen-host pawn drains its own queue"),
+                FGMASBoundQueueV2::WouldDrainClientQueueLocally(false, false, true, false));
+        });
+
+        It("drains for a locally controlled dedicated-server pawn", [this]()
+        {
+            TestTrue(TEXT("Server-controlled dedicated pawn drains its own queue"),
+                FGMASBoundQueueV2::WouldDrainClientQueueLocally(false, false, false, true));
+        });
+
+        It("does not drain for a remote-controlled server pawn", [this]()
+        {
+            TestFalse(TEXT("Nothing on the server drains a remote pawn's client queue -- pending ops there are an invariant violation"),
+                FGMASBoundQueueV2::WouldDrainClientQueueLocally(false, false, false, false));
+        });
+    });
+
     // ── Grace-expiry force cleanup ───────────────────────────────────────────
     Describe("Grace-expiry force", [this]()
     {
@@ -146,10 +188,12 @@ void FGMASServerLocalActivationSpec::Define()
 
         It("drops a ClientQueuedOperations entry stranded by a self-executed Client RPC", [this]()
         {
-            // CheckValidState legitimately errors while the stranded entry exists
-            // (that diagnostic is the bug's visible symptom). The assertion below
-            // is that the force CLEANS IT UP so the error cannot repeat forever.
-            AddExpectedError(TEXT("ClientQueuedOperations has"), EAutomationExpectedErrorFlags::Contains, 0);
+            // The harness is NM_Standalone — a self-draining machine — so
+            // CheckValidState stays SILENT about the transiently-parked entry
+            // (see the "Transient self-drain window" spec below). No expected
+            // error is registered: the automation framework's unexpected-error
+            // rule guards that silence. The assertions below pin the force
+            // path: it CLEANS UP the stranded entry so it cannot linger.
 
             FGMASBoundQueueV2& Q = AbilityComp->GetBoundQueueV2ForTest();
 
@@ -171,6 +215,45 @@ void FGMASServerLocalActivationSpec::Define()
                 Q.ServerQueuedBoundOperationsGracePeriods.Num(), 0);
             TestEqual(TEXT("Stranded ClientQueuedOperations entry must be dropped by the force"),
                 Q.ClientQueuedOperations.Num(), 0);
+        });
+    });
+
+    // ── Transient self-drain window ──────────────────────────────────────────
+    Describe("Transient self-drain window", [this]()
+    {
+        BeforeEach([this]() { SetupHarness(); });
+        AfterEach([this]() { TeardownHarness(); });
+
+        It("does not error while an op awaits the next local drain", [this]()
+        {
+            // The user-visible false positive: on a self-draining machine (this
+            // harness runs NM_Standalone) QueueServerOperation's Client RPC lands
+            // the op in our own ClientQueuedOperations, and CheckValidState used
+            // to error in the one-move window before GenPreLocalMoveExecution
+            // packs it. Deliberately NO AddExpectedError here: an error logged
+            // during this test fails it via the framework's unexpected-error rule.
+            FGMASBoundQueueV2& Q = AbilityComp->GetBoundQueueV2ForTest();
+
+            FGMASBoundQueueV2AbilityActivationOperation Op;
+            Op.InputTag = AbilityTag;
+            const int OpID = Q.MakeOperationData<FGMASBoundQueueV2AbilityActivationOperation>(Op);
+
+            Q.QueueServerOperation(OpID, 1.0f);
+            Q.ClientQueuedOperations.Add(OpID); // self-executed Client RPC landing
+
+            Q.GenAncillaryTick(0.01f); // grace NOT expired -> no force, just the state check
+
+            TestEqual(TEXT("Op must still be queued for the next local drain"),
+                Q.ClientQueuedOperations.Num(), 1);
+
+            Q.GenPreLocalMoveExecution(); // the drain the window was waiting for
+
+            TestEqual(TEXT("Local drain must consume the queued op"),
+                Q.ClientQueuedOperations.Num(), 0);
+            const FGMASBoundQueueV2OperationBaseData* Packed =
+                Q.OperationData.GetPtr<FGMASBoundQueueV2OperationBaseData>();
+            TestTrue(TEXT("Drained op must be packed into OperationData"),
+                Packed != nullptr && Packed->OperationID == OpID);
         });
     });
 

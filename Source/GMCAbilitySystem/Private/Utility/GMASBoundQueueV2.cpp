@@ -76,13 +76,26 @@ void FGMASBoundQueueV2::BindToGMC(UGMC_MovementUtilityCmp* MovementComponent)
 	GMCMovementComponent = MovementComponent;
 }
 
+bool FGMASBoundQueueV2::WouldDrainClientQueueLocally(const bool bIsClientNetMode, const bool bIsStandaloneNetMode,
+	const bool bIsLocallyControlledListenServerPawn, const bool bIsLocallyControlledDedicatedServerPawn)
+{
+	return bIsClientNetMode || bIsStandaloneNetMode ||
+		bIsLocallyControlledListenServerPawn || bIsLocallyControlledDedicatedServerPawn;
+}
+
+bool FGMASBoundQueueV2::DrainsClientQueueLocally() const
+{
+	return WouldDrainClientQueueLocally(
+		GMCMovementComponent->GetNetMode() == NM_Client,
+		GMCMovementComponent->GetNetMode() == NM_Standalone,
+		GMCMovementComponent->IsLocallyControlledListenServerPawn(),
+		GMCMovementComponent->IsLocallyControlledDedicatedServerPawn());
+}
+
 void FGMASBoundQueueV2::GenPreLocalMoveExecution()
 {
 	// Client Logic
-	if (GMCMovementComponent->GetNetMode() == NM_Client ||
-		GMCMovementComponent->GetNetMode() == NM_Standalone ||
-		GMCMovementComponent->IsLocallyControlledListenServerPawn() ||
-		GMCMovementComponent->IsLocallyControlledDedicatedServerPawn())
+	if (DrainsClientQueueLocally())
 	{
 		if (ClientQueuedOperations.Num() == 0)
 		{
@@ -235,8 +248,15 @@ void FGMASBoundQueueV2::CheckValidState() const
 	// Server Logic
 	if (GMCMovementComponent->GetNetMode() < NM_Client)
 	{
-		// Check Client Queued Operations is empty
-		if (ClientQueuedOperations.Num() > 0)
+		// Machines that drain their own client queue (standalone, listen-host pawn,
+		// server-controlled pawn) legitimately hold a queued op for up to one move:
+		// QueueServerOperation's Client RPC self-executes locally, parking the op in
+		// ClientQueuedOperations until the next GenPreLocalMoveExecution packs it.
+		// Only a pawn whose client queue nothing on this machine drains (a remote-
+		// controlled player pawn) may treat pending client ops as an invariant
+		// violation. A genuinely stranded op on a self-draining machine is still
+		// force-executed and dropped by the grace-expiry path in GenAncillaryTick.
+		if (!DrainsClientQueueLocally() && ClientQueuedOperations.Num() > 0)
 		{
 			UE_LOG(LogGMCAbilitySystem, Error, TEXT("ClientQueuedOperations has %d pending operations on server"), ClientQueuedOperations.Num());
 		}
