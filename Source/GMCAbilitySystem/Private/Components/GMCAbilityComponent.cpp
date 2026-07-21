@@ -790,6 +790,18 @@ bool UGMC_AbilitySystemComponent::ShouldBypassServerOperationQueue(const bool bI
 		&& !bIsLocallyControlledServerPawn && !bIsRemotelyControlledServerPawn;
 }
 
+bool UGMC_AbilitySystemComponent::ShouldRefuseServerOriginatedActivation(
+	const bool bBlockServerOriginationForRemotePawns, const bool bIsAuthority,
+	const bool bIsNetworkedServer, const bool bIsRemotelyControlledServerPawn)
+{
+	// Refuse only the exact phantom case: opted in, authority on a networked server,
+	// pawn controlled by a remote client (which self-originates via its move stream).
+	// Standalone, listen-host own pawns, server AI, and unowned server pawns are all
+	// untouched — as is everything when the flag is off.
+	return bBlockServerOriginationForRemotePawns && bIsAuthority
+		&& bIsNetworkedServer && bIsRemotelyControlledServerPawn;
+}
+
 void UGMC_AbilitySystemComponent::QueueAbility(FGameplayTag InputTag, const UInputAction* InputAction, bool bPreventConcurrentActivation)
 {
 	if (GetOwnerRole() != ROLE_AutonomousProxy && GetOwnerRole() != ROLE_Authority) return;
@@ -805,6 +817,29 @@ void UGMC_AbilitySystemComponent::QueueAbility(FGameplayTag InputTag, const UInp
 	// Also keeps GetGrantedAbilitiesByTag from logging a not-granted warning per polled tick.
 	const FAbilityMapData* MapEntry = AbilityMap.Find(InputTag);
 	if (MapEntry == nullptr || MapEntry->Abilities.IsEmpty()) return;
+
+	// Origination guard (opt-in): a remotely controlled pawn's activations originate on
+	// its owning client and arrive through the move stream (ServerProcessOperation). A
+	// server-side QueueAbility call for such a pawn — typically a pawn Blueprint or
+	// component graph that executes symmetrically on both machines — mints a ServerAuth
+	// op that reaches the owning client one full RTT stale and activates a phantom
+	// instance the client never predicted (2026-07-21 wallrun phantom root cause: the
+	// stale instance hijacked the next wall's attach and wedged the stacked-input
+	// queue). Refuse before ANY activation path (client-auth included) and log so the
+	// offending call site is visible instead of silently desynchronizing under lag.
+	if (GMCMovementComponent && ShouldRefuseServerOriginatedActivation(
+			bBlockServerOriginationForRemotePawns,
+			HasAuthority(),
+			GMCMovementComponent->IsNetworkedServer(),
+			GMCMovementComponent->IsRemotelyControlledServerPawn()))
+	{
+		UE_LOG(LogGMCAbilitySystem, Verbose,
+			TEXT("[OriginationGuard] %s: refused server-side QueueAbility(%s) for a remotely "
+			     "controlled pawn — the owning client originates activations; make the calling "
+			     "graph run on the input-origination instance only (e.g. QueueMovementAbility)."),
+			*GetNameSafe(GetOwner()), *InputTag.ToString());
+		return;
+	}
 
 	// Detect client-auth path before standard routing.
 	TArray<TSubclassOf<UGMCAbility>> Candidates = GetGrantedAbilitiesByTag(InputTag);

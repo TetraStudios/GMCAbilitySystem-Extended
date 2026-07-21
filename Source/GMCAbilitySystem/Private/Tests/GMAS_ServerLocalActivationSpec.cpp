@@ -146,6 +146,55 @@ void FGMASServerLocalActivationSpec::Define()
         });
     });
 
+    // ── Server-origination refusal (phantom-activation guard) ────────────────
+    Describe("ShouldRefuseServerOriginatedActivation", [this]()
+    {
+        It("never refuses when the opt-in flag is off (stock GMAS behavior)", [this]()
+        {
+            TestFalse(TEXT("Flag off: even the phantom combo (authority+networked+remote) must queue"),
+                UGMC_AbilitySystemComponent::ShouldRefuseServerOriginatedActivation(false, true, true, true));
+            TestFalse(TEXT("Flag off: standalone must queue"),
+                UGMC_AbilitySystemComponent::ShouldRefuseServerOriginatedActivation(false, true, false, false));
+        });
+
+        It("refuses the phantom combo: authority minting an op for a remote-client pawn", [this]()
+        {
+            // The 2026-07-21 wallrun phantom: a symmetric Blueprint graph executing on
+            // the server called QueueAbility for a remote pawn; the minted ServerAuth op
+            // reached the owning client one RTT stale and activated an instance the
+            // client never predicted.
+            TestTrue(TEXT("Flag on + authority + networked server + remotely controlled pawn must refuse"),
+                UGMC_AbilitySystemComponent::ShouldRefuseServerOriginatedActivation(true, true, true, true));
+        });
+
+        It("keeps the queue path on non-authority", [this]()
+        {
+            TestFalse(TEXT("A client's own QueueAbility is the legitimate origination path"),
+                UGMC_AbilitySystemComponent::ShouldRefuseServerOriginatedActivation(true, false, false, false));
+            TestFalse(TEXT("Non-authority on a networked context must queue"),
+                UGMC_AbilitySystemComponent::ShouldRefuseServerOriginatedActivation(true, false, true, true));
+        });
+
+        It("keeps the queue path in standalone", [this]()
+        {
+            TestFalse(TEXT("Standalone (authority, not a networked server) self-drains legitimately"),
+                UGMC_AbilitySystemComponent::ShouldRefuseServerOriginatedActivation(true, true, false, false));
+        });
+
+        It("keeps the queue path for non-remote server pawns", [this]()
+        {
+            TestFalse(TEXT("Listen-host own pawn / server AI pawn originates its own inputs"),
+                UGMC_AbilitySystemComponent::ShouldRefuseServerOriginatedActivation(true, true, true, false));
+        });
+
+        It("defaults the opt-in flag to off on the stock component", [this]()
+        {
+            UGMC_AbilitySystemComponent* Comp = NewObject<UGMC_AbilitySystemComponent>(GetTransientPackage());
+            TestFalse(TEXT("bBlockServerOriginationForRemotePawns must default false in the plugin"),
+                Comp->bBlockServerOriginationForRemotePawns);
+        });
+    });
+
     // ── Client-queue drain routing ───────────────────────────────────────────
     Describe("WouldDrainClientQueueLocally", [this]()
     {

@@ -519,6 +519,28 @@ public:
 	                                             bool bIsLocallyControlledServerPawn,
 	                                             bool bIsRemotelyControlledServerPawn);
 
+	// Pure origination decision for QueueAbility on the authority (opt-in via
+	// bBlockServerOriginationForRemotePawns). A remote autonomous client originates
+	// its own activation operations — they arrive through the client's move stream
+	// and are executed via ServerProcessOperation — so a server-side QueueAbility
+	// call for a remotely controlled pawn is a symmetric-execution duplicate
+	// (typically a pawn Blueprint/component graph that runs on both machines). The
+	// minted ServerAuth op reaches the owning client a full RTT stale and activates
+	// a phantom instance the client never predicted (2026-07-21 wallrun phantom
+	// root cause). Static and stateless so headless specs can pin the table.
+	static bool ShouldRefuseServerOriginatedActivation(bool bBlockServerOriginationForRemotePawns,
+	                                                   bool bIsAuthority,
+	                                                   bool bIsNetworkedServer,
+	                                                   bool bIsRemotelyControlledServerPawn);
+
+	// Opt-in for ShouldRefuseServerOriginatedActivation: when true, QueueAbility on
+	// the authority refuses to mint ServerAuth activation operations for remotely
+	// controlled pawns — their owning client is the input-origination instance and
+	// its replicated operations are the only legitimate activation source. Leave
+	// false (default) to keep stock GMAS behavior, where a server-side call
+	// broadcasts a deliberate server-forced activation to the owning client.
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="GMAS|Abilities")
+	bool bBlockServerOriginationForRemotePawns = false;
 
 	/**
 	 * Queue an ability for activation based on the provided input tag and action.
