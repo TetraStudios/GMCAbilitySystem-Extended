@@ -156,6 +156,28 @@ void FGMASReplayResumeSpec::Define()
 			AbilityComp->bForceReplayingForTest = false;
 		});
 
+		It("does not refuse the re-delivered activation of an earlier, ended instance of its class", [this]()
+		{
+			// A chain: 7 lives 1.0 to 1.3, then 8 starts at 2.0 and is still live. A replay that starts
+			// before 7's activation must get 7 back from its re-delivered activation.
+			Activate(7, 1.0);
+			TickAt(1.0); TickAt(1.1); TickAt(1.2); TickAt(1.3);
+			UGMAS_TestSelfEndAbility::EndAtMoveTime = 9.0;
+			Activate(8, 2.0);
+			TickAt(2.0);
+			TestFalse("outside a replay the single-instance rule still refuses", Activate(7, 1.0));
+
+			AbilityComp->bForceReplayingForTest = true;
+			TestTrue("re-delivered activation of the ended instance is accepted", Activate(7, 1.0));
+			TestTrue("7 exists again", AbilityComp->GetActiveAbilities().Contains(7));
+			TestTrue("8 is kept", AbilityComp->GetActiveAbilities().Contains(8));
+			TestEqual("7 began afresh", UGMAS_TestSelfEndAbility::BeginCount, 3);
+			const int32 TicksBefore = UGMAS_TestSelfEndAbility::TickCount;
+			TickAt(1.0);
+			TestEqual("only 7 ticks on its own moves", UGMAS_TestSelfEndAbility::TickCount, TicksBefore + 1);
+			AbilityComp->bForceReplayingForTest = false;
+		});
+
 		It("is left alone outside a replay", [this]()
 		{
 			UGMAS_TestSelfEndAbility::EndAtMoveTime = 9.0;

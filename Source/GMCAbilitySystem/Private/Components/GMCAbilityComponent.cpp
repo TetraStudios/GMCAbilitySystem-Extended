@@ -767,6 +767,9 @@ bool UGMC_AbilitySystemComponent::TryActivateAbility(const TSubclassOf<UGMCAbili
 
 	Ability->Execute(this, AbilityID, InputAction);
 	ActiveAbilities.Add(AbilityID, Ability);
+	UE_CLOG(GMASReplayResume::IsLog() && IsReplayingForGMASLogic(), LogGMCAbilitySystem, Log,
+		TEXT("[ReplayResume] activate %s id=%d move=%.3f%s"), *GetNameSafe(ActivatedAbility), AbilityID, ActionTimer,
+		Ability->AbilityState == EAbilityState::Ended ? TEXT(" (ended in PreBeginAbility)") : TEXT(""));
 
 	// Only signal "confirmed" to the client if the server-side Execute did NOT bail out
 	// during PreBeginAbility (cooldown, PreExecuteCheck, blocked-by-ability, blocked-by-tag).
@@ -812,6 +815,12 @@ UGMCAbility* UGMC_AbilitySystemComponent::NewAbilityInstance(const TSubclassOf<U
 	Ability->AbilityDefinition      = AbilityCDO->AbilityDefinition;
 	Ability->bReplayResumable       = AbilityCDO->bReplayResumable;
 	return Ability;
+}
+
+bool UGMC_AbilitySystemComponent::IsNotYetActiveInReplay(const UGMCAbility* Ability) const
+{
+	return Ability && Ability->bReplayResumable && ActionTimer < Ability->GetActivationMoveTime()
+		&& GMASReplayResume::IsOn() && IsReplayingForGMASLogic();
 }
 
 void UGMC_AbilitySystemComponent::NoteReplayResumableEnded(const UGMCAbility& Ability, const bool bEndedItself)
@@ -1067,7 +1076,8 @@ int32 UGMC_AbilitySystemComponent::GetActiveAbilityCount(TSubclassOf<UGMCAbility
 
 	for (const auto& ActiveAbilityData : ActiveAbilities)
 	{
-		if (ActiveAbilityData.Value->IsA(AbilityClass) && ActiveAbilityData.Value->AbilityState != EAbilityState::Ended) Result++;
+		if (ActiveAbilityData.Value->IsA(AbilityClass) && ActiveAbilityData.Value->AbilityState != EAbilityState::Ended
+			&& !IsNotYetActiveInReplay(ActiveAbilityData.Value)) Result++;
 	}
 
 	return Result;
@@ -1077,7 +1087,8 @@ int32 UGMC_AbilitySystemComponent::GetActiveAbilityCount(TSubclassOf<UGMCAbility
 bool UGMC_AbilitySystemComponent::IsAbilityTagBlocked(const FGameplayTag AbilityTag) const {
 	
 	for (const auto& ActiveAbility : ActiveAbilities) {
-		if (IsValid(ActiveAbility.Value) && ActiveAbility.Value->AbilityState != EAbilityState::Ended)
+		if (IsValid(ActiveAbility.Value) && ActiveAbility.Value->AbilityState != EAbilityState::Ended
+			&& !IsNotYetActiveInReplay(ActiveAbility.Value))
 		{
 			if (ActiveAbility.Value->bBlockAllOtherAbilities &&
 				!AbilityTag.MatchesAny(ActiveAbility.Value->BlockAllAllowedTags))
@@ -1103,7 +1114,7 @@ int UGMC_AbilitySystemComponent::EndAbilitiesByTag(FGameplayTag AbilityTag) {
 	int AbilitiesEnded = 0;
 	for (const auto& ActiveAbilityData : ActiveAbilities)
 	{
-		if (ActiveAbilityData.Value->AbilityTag.MatchesTag(AbilityTag))
+		if (ActiveAbilityData.Value->AbilityTag.MatchesTag(AbilityTag) && !IsNotYetActiveInReplay(ActiveAbilityData.Value))
 		{
 			ActiveAbilityData.Value->EndAbility();
 			AbilitiesEnded++;
@@ -1852,7 +1863,7 @@ void UGMC_AbilitySystemComponent::TickActiveAbilities(float DeltaTime)
 	for (const TPair<int, UGMCAbility*>& Ability : ActiveAbilities)
 	{
 		// A replayed move from before this instance's activation: in the first run it did not exist yet.
-		if (bReplayGate && Ability.Value->bReplayResumable && ActionTimer < Ability.Value->GetActivationMoveTime())
+		if (bReplayGate && IsNotYetActiveInReplay(Ability.Value))
 		{
 			UE_CLOG(GMASReplayResume::IsLog() && GMCMovementComponent && GMCMovementComponent->CL_GetCurrentReplayMoveIndex() == 0,
 				LogGMCAbilitySystem, Log, TEXT("[ReplayResume] skip %s id=%d until move=%.3f (replay starts at %.3f)"),

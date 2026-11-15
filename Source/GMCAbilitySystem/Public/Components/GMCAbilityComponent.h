@@ -298,6 +298,12 @@ public:
 	 *  first run (activated on an earlier move, ended on this one or later) and are no longer in the map. */
 	void ResumeEndedAbilitiesForReplay(double ReplayStartMoveTime);
 
+	/** A bReplayResumable instance on a replayed move earlier than its activation move: in the first run it
+	 *  did not exist yet. It is not ticked, and it does not count as an active ability in any gate
+	 *  (single instance, blocked-by, block-all, cancel-by-tag, end-others): otherwise it refuses the
+	 *  re-delivered activation of the earlier instance whose moves are being replayed. */
+	bool IsNotYetActiveInReplay(const UGMCAbility* Ability) const;
+
 	// Is this a server-only pawn (not player-controlled)?
 	bool IsServerOnly() const;
 

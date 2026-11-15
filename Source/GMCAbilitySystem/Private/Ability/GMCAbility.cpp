@@ -431,7 +431,7 @@ void UGMCAbility::CancelConflictingAbilities()
 		{
 			if (ActiveAbility.Value == this) continue;
 
-			if (EndOtherAbilitiesQuery.Matches(ActiveAbility.Value->AbilityDefinition))
+			if (EndOtherAbilitiesQuery.Matches(ActiveAbility.Value->AbilityDefinition) && !OwnerAbilityComponent->IsNotYetActiveInReplay(ActiveAbility.Value))
 			{
 				ActiveAbility.Value->SetPendingEnd();
 				UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability %s cancelled ability %s (matching definition query)"),
@@ -653,9 +653,10 @@ bool UGMCAbility::PreBeginAbility()
 
 	for (auto& OtherAbilityTag : BlockedByOtherAbility)
 	{
-		if (ActiveAbilities.FindByPredicate([&OtherAbilityTag](const UGMCAbility* ActiveAbility) {
+		if (ActiveAbilities.FindByPredicate([&OtherAbilityTag, this](const UGMCAbility* ActiveAbility) {
 			return ActiveAbility
 			&& ActiveAbility->IsActive()
+			&& !OwnerAbilityComponent->IsNotYetActiveInReplay(ActiveAbility)
 			&& ActiveAbility->AbilityTag.MatchesTag(OtherAbilityTag);
 		}))
 		{
@@ -692,7 +693,7 @@ void UGMCAbility::BeginAbility()
 		{
 			const FGameplayTagContainer& ActiveAbilityTags = ActiveAbility.Value->AbilityDefinition;
 
-			if (BlockQuery.Matches(ActiveAbilityTags))
+			if (BlockQuery.Matches(ActiveAbilityTags) && !OwnerAbilityComponent->IsNotYetActiveInReplay(ActiveAbility.Value))
 			{
 				ActiveAbility.Value->SetPendingEnd();
 				UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability %s blocked ability %s (matching query)"),
