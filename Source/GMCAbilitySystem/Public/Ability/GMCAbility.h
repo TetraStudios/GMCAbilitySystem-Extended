@@ -67,6 +67,32 @@ public:
 	FString GetAbilityCutDiagnostics() const;
 	
 	void Execute(UGMC_AbilitySystemComponent* InAbilityComponent, int InAbilityID, const UInputAction* InputAction = nullptr);
+
+	/** Opt-in. GMAS does not rewind ability instances when GMC replays moves. With this set, on the owning
+	 *  client and during a replay only, the instance exists on the moves it existed on in the first run:
+	 *  one that has since ended itself is re-created without BeginAbility when a replay starts inside its
+	 *  life, a live one is not ticked on moves before its activation, and OnReplayRebegin runs on its
+	 *  activation move (bound state was rewound to before it). Only for abilities whose Tick derives its
+	 *  decisions from GMC-bound state.
+	 *  Console variable gmas.ReplayResume (0 = off for every ability). */
+	UPROPERTY(EditDefaultsOnly, Category = "GMCAbilitySystem")
+	bool bReplayResumable = false;
+
+	/** Move timestamp of the activation, at full precision (ClientStartTime is a float). */
+	double GetActivationMoveTime() const { return ActivationMoveTime; }
+
+	/** Puts a fresh instance into the running state without BeginAbility, for a replay that starts inside
+	 *  the first-run life of the instance it replaces. */
+	void ResumeForReplay(UGMC_AbilitySystemComponent* InAbilityComponent, int InAbilityID, const UInputAction* InputAction, double InActivationMoveTime, bool bInServerConfirmed);
+
+	/** Called on a resumed instance: restore members BeginAbility or the first Tick would have set. */
+	virtual void OnResumedForReplay() {}
+
+	/** A replay reached this live instance's activation move. Bound state was rewound to before the begin:
+	 *  write again what BeginAbility wrote to bound state (state tags, begin requests) and reset the members
+	 *  it reset. Not BeginAbility itself: that would broadcast the activation, run the Blueprint begin event
+	 *  and cancel other abilities a second time. */
+	virtual void OnReplayRebegin() {}
 	
 	// Called by AbilityComponent (this is a prediction tick so should be used for movement)
 	virtual void Tick(float DeltaTime);
@@ -340,6 +366,12 @@ private:
 	TSet<int> WarnedDivergentTaskIDs;
 
 	float ClientStartTime = 0.f;
+
+	double ActivationMoveTime = 0.0;
+
+	// Set when the base Tick ends the ability (confirm timeout, pending end): nothing in a replay would
+	// end a resumed instance the same way, so such an end is not resumable.
+	bool bEndedByFramework = false;
 	
 
 

@@ -113,12 +113,14 @@ void UGMCAbility::Tick(float DeltaTime)
 			UE_LOG(LogGMCAbilitySystem, Error,
 				TEXT("[AbilityCut] Client removing unconfirmed ability after %.2fs (no RPCConfirmAbilityActivation received). %s"),
 				ServerConfirmTimeout, *GetAbilityCutDiagnostics());
+			bEndedByFramework = true;
 			EndAbility();
 			return;
 		}
 	}
 
 	if (bEndPending) {
+		bEndedByFramework = true;
 		EndAbility();
 		return;
 	}
@@ -233,7 +235,20 @@ void UGMCAbility::Execute(UGMC_AbilitySystemComponent* InAbilityComponent, int I
 	this->AbilityID = InAbilityID;
 	this->OwnerAbilityComponent = InAbilityComponent;
 	this->ClientStartTime = InAbilityComponent->ActionTimer;
+	this->ActivationMoveTime = InAbilityComponent->ActionTimer;
 	PreBeginAbility();
+}
+
+void UGMCAbility::ResumeForReplay(UGMC_AbilitySystemComponent* InAbilityComponent, int InAbilityID, const UInputAction* InputAction, double InActivationMoveTime, bool bInServerConfirmed)
+{
+	AbilityInputAction    = InputAction;
+	AbilityID             = InAbilityID;
+	OwnerAbilityComponent = InAbilityComponent;
+	ClientStartTime       = static_cast<float>(InActivationMoveTime);
+	ActivationMoveTime    = InActivationMoveTime;
+	bServerConfirmed      = bInServerConfirmed;
+	AbilityState          = EAbilityState::Initialized;
+	OnResumedForReplay();
 }
 
 bool UGMCAbility::CanAffordAbilityCost(float DeltaTime) const
@@ -586,6 +601,11 @@ void UGMCAbility::FinishEndAbility() {
 	}
 
 	AbilityState = EAbilityState::Ended;
+
+	if (bReplayResumable && OwnerAbilityComponent)
+	{
+		OwnerAbilityComponent->NoteReplayResumableEnded(*this, !bEndedByFramework);
+	}
 }
 
 

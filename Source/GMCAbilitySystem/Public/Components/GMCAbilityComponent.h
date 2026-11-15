@@ -290,6 +290,14 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "GMCAbilitySystem")
 	double ActionTimer;
 
+	/** Called by a bReplayResumable ability when it ends. Records it for ResumeEndedAbilitiesForReplay if it
+	 *  ended itself inside its own prediction Tick on the owning client; any other end drops its record. */
+	void NoteReplayResumableEnded(const UGMCAbility& Ability, bool bEndedItself);
+
+	/** First move of a client replay: re-create the recorded instances that were alive on this move in the
+	 *  first run (activated on an earlier move, ended on this one or later) and are no longer in the map. */
+	void ResumeEndedAbilitiesForReplay(double ReplayStartMoveTime);
+
 	// Is this a server-only pawn (not player-controlled)?
 	bool IsServerOnly() const;
 
@@ -1194,6 +1202,24 @@ private:
 	// Clear out abilities in the Ended state from the ActivateAbilities map
 	void CleanupStaleAbilities();
 
+	// --- Replay-resumable abilities (UGMCAbility::bReplayResumable), owning client only ---
+	struct FReplayResumableEnded
+	{
+		int AbilityID = 0;
+		TWeakObjectPtr<UClass> AbilityClass;
+		FGameplayTag InputTag;
+		TWeakObjectPtr<const UInputAction> InputAction;
+		double ActivationMoveTime = 0.0;
+		double EndMoveTime = 0.0;
+		bool bServerConfirmed = false;
+	};
+	// Instances that ended themselves inside their own prediction Tick, newest last.
+	TArray<FReplayResumableEnded> ReplayResumableEnded;
+	// The instance TickActiveAbilities is ticking right now, null otherwise.
+	UGMCAbility* TickingAbility = nullptr;
+	// NewObject plus the CDO property copies an instance needs; shared by activation and replay resume.
+	UGMCAbility* NewAbilityInstance(TSubclassOf<UGMCAbility> AbilityClass, FGameplayTag ActivationTag);
+
 	// Tick active abilities, primarily the Tasks inside them
 	void TickActiveAbilities(float DeltaTime);
 
@@ -1316,6 +1342,11 @@ public:
 	// IsReplayingForGMASLogic() to return true, exercising the production code
 	// path that skips polling/timeout reaping during replay.
 	bool bForceReplayingForTest = false;
+
+	// Test seams for the replay-resume path: tick and clean up without GenPredictionTick, which would
+	// overwrite ActionTimer from the harness movement component.
+	void TickActiveAbilitiesForTest(float DeltaTime) { TickActiveAbilities(DeltaTime); }
+	void CleanupStaleAbilitiesForTest() { CleanupStaleAbilities(); }
 
 	// Test seam for ServerProcessOperation. The function is private so tests cannot
 	// call it directly; this thin wrapper exposes it under WITH_AUTOMATION_WORKER only.

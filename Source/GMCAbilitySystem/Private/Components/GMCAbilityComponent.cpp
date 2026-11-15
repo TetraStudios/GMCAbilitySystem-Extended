@@ -23,6 +23,20 @@
 #include "TimerManager.h"
 #include "HAL/IConsoleManager.h"
 #include "GameFramework/Pawn.h"
+#include "InputAction.h"
+
+namespace GMASReplayResume {
+	// UGMCAbility::bReplayResumable. One switch for the whole feature so a before/after measurement needs
+	// no rebuild; client-side only, so it need not match the server.
+	static TAutoConsoleVariable<int32> CVarReplayResume(
+		TEXT("gmas.ReplayResume"),
+		1,
+		TEXT("Replay handling of abilities marked bReplayResumable. 0 = off (instances are never resumed, ")
+		TEXT("skipped or re-begun), 1 = on, 2 = on and log every resume, re-begin and not-yet-active skip."),
+		ECVF_Default);
+	static bool IsOn()  { return CVarReplayResume.GetValueOnAnyThread() > 0; }
+	static bool IsLog() { return CVarReplayResume.GetValueOnAnyThread() > 1; }
+}
 
 namespace GMASApplyTrace {
 	// Diagnostic: dump full C++ + script callstack on every ApplyAbilityEffect that creates a
@@ -693,6 +707,20 @@ bool UGMC_AbilitySystemComponent::TryActivateAbility(const TSubclassOf<UGMCAbili
 		AbilityID = ForcedAbilityID;
 		if (ActiveAbilities.Contains(AbilityID))
 		{
+			// A replay reached the activation move of a live resumable instance. Bound state was rewound to
+			// before its begin, so whatever BeginAbility wrote there (state tags, begin requests) is gone:
+			// the instance writes it again. A fresh activation instead would pass through gates that read
+			// state GMAS does not rewind (cooldowns, other live instances) and could refuse.
+			UGMCAbility* Live = ActiveAbilities[AbilityID];
+			if (Live && Live->bReplayResumable && Live->IsActive() && Live->GetClass() == ActivatedAbility.Get()
+				&& Live->GetActivationMoveTime() == ActionTimer
+				&& GMASReplayResume::IsOn() && IsReplayingForGMASLogic())
+			{
+				UE_CLOG(GMASReplayResume::IsLog(), LogGMCAbilitySystem, Log,
+					TEXT("[ReplayResume] re-begin %s id=%d move=%.3f"), *GetNameSafe(ActivatedAbility), AbilityID, ActionTimer);
+				Live->OnReplayRebegin();
+				return true;
+			}
 			UE_LOG(LogGMCAbilitySystem, Verbose, TEXT("Ability Activation for %s skipped: operation-derived ID %d already active (duplicate delivery/replay)."),
 				*GetNameSafe(ActivatedAbility), AbilityID);
 			return false;
@@ -735,6 +763,32 @@ bool UGMC_AbilitySystemComponent::TryActivateAbility(const TSubclassOf<UGMCAbili
 
 	UE_LOG(LogGMCAbilitySystem, VeryVerbose, TEXT("[Server: %hhd] Generated Ability Activation ID: %d"), HasAuthority(), AbilityID);
 	
+	UGMCAbility* Ability = NewAbilityInstance(ActivatedAbility, ActivationTag);
+
+	Ability->Execute(this, AbilityID, InputAction);
+	ActiveAbilities.Add(AbilityID, Ability);
+
+	// Only signal "confirmed" to the client if the server-side Execute did NOT bail out
+	// during PreBeginAbility (cooldown, PreExecuteCheck, blocked-by-ability, blocked-by-tag).
+	// CancelAbility sets AbilityState = Ended *before* BeginAbility runs; without this
+	// gate the client receives RPCConfirmAbilityActivation for an ability the server
+	// just cancelled, sets bServerConfirmed=true, and the Tick-time
+	// `ClientStartTime + ServerConfirmTimeout < ActionTimer` check never fires —
+	// the predicted ability runs indefinitely on the client.
+	// Skip the confirm RPC when the activation came from the client-auth path
+	// (the client never expects confirmation for trust-based activations).
+	if (HasAuthority() && Ability->AbilityState != EAbilityState::Ended && !bSkipActivationTagsCheck)
+	{
+		RPCConfirmAbilityActivation(AbilityID);
+	}
+
+	return true;
+}
+
+UGMCAbility* UGMC_AbilitySystemComponent::NewAbilityInstance(const TSubclassOf<UGMCAbility> ActivatedAbility, const FGameplayTag ActivationTag)
+{
+	const UGMCAbility* AbilityCDO = ActivatedAbility->GetDefaultObject<UGMCAbility>();
+
 	UGMCAbility* Ability = NewObject<UGMCAbility>(this, ActivatedAbility);
 	Ability->AbilityData = AbilityData;
 	Ability->AbilityData.InputTag = ActivationTag;
@@ -756,25 +810,83 @@ bool UGMC_AbilitySystemComponent::TryActivateAbility(const TSubclassOf<UGMCAbili
 	Ability->ChainConsumeWindowTags = AbilityCDO->ChainConsumeWindowTags;
 	Ability->CancelAbilitiesWithTag = AbilityCDO->CancelAbilitiesWithTag;
 	Ability->AbilityDefinition      = AbilityCDO->AbilityDefinition;
+	Ability->bReplayResumable       = AbilityCDO->bReplayResumable;
+	return Ability;
+}
 
-	Ability->Execute(this, AbilityID, InputAction);
-	ActiveAbilities.Add(AbilityID, Ability);
-
-	// Only signal "confirmed" to the client if the server-side Execute did NOT bail out
-	// during PreBeginAbility (cooldown, PreExecuteCheck, blocked-by-ability, blocked-by-tag).
-	// CancelAbility sets AbilityState = Ended *before* BeginAbility runs; without this
-	// gate the client receives RPCConfirmAbilityActivation for an ability the server
-	// just cancelled, sets bServerConfirmed=true, and the Tick-time
-	// `ClientStartTime + ServerConfirmTimeout < ActionTimer` check never fires —
-	// the predicted ability runs indefinitely on the client.
-	// Skip the confirm RPC when the activation came from the client-auth path
-	// (the client never expects confirmation for trust-based activations).
-	if (HasAuthority() && Ability->AbilityState != EAbilityState::Ended && !bSkipActivationTagsCheck)
+void UGMC_AbilitySystemComponent::NoteReplayResumableEnded(const UGMCAbility& Ability, const bool bEndedItself)
+{
+	if (IsAuthorityForGMASLogic() || !GMASReplayResume::IsOn())
 	{
-		RPCConfirmAbilityActivation(AbilityID);
+		return; // replays happen on the owning client only
 	}
 
-	return true;
+	// shortcut: a record is kept for 3 s of move time, far past any move history at 500 ms RTT; raise it
+	// if GMC's client move history is ever allowed to span more.
+	const int EndedID = Ability.GetAbilityID();
+	const double Now = ActionTimer;
+	ReplayResumableEnded.RemoveAll([EndedID, Now](const FReplayResumableEnded& Rec)
+	{
+		return Rec.AbilityID == EndedID || Rec.EndMoveTime < Now - 3.0;
+	});
+
+	// Only an end the instance decided inside its own prediction Tick replays the same way. One ended by
+	// the server's RPC, the confirm timeout or another ability would have nothing to end it again.
+	if (!bEndedItself || TickingAbility != &Ability)
+	{
+		return;
+	}
+
+	FReplayResumableEnded& Rec = ReplayResumableEnded.AddDefaulted_GetRef();
+	Rec.AbilityID          = EndedID;
+	Rec.AbilityClass       = Ability.GetClass();
+	Rec.InputTag           = Ability.AbilityData.InputTag;
+	Rec.InputAction        = Ability.AbilityInputAction.Get();
+	Rec.ActivationMoveTime = Ability.GetActivationMoveTime();
+	Rec.EndMoveTime        = Now;
+	Rec.bServerConfirmed   = Ability.IsServerConfirmed();
+}
+
+void UGMC_AbilitySystemComponent::ResumeEndedAbilitiesForReplay(const double ReplayStartMoveTime)
+{
+	for (const FReplayResumableEnded& Rec : ReplayResumableEnded)
+	{
+		UClass* AbilityClass = Rec.AbilityClass.Get();
+		// Alive on this move in the first run: activated on an earlier move (an activation on this very
+		// move is re-delivered by its operation) and ended on this move or a later one.
+		if (!AbilityClass || !(Rec.ActivationMoveTime < ReplayStartMoveTime && ReplayStartMoveTime <= Rec.EndMoveTime)
+			|| ActiveAbilities.Contains(Rec.AbilityID))
+		{
+			continue;
+		}
+
+		// One instance at a time, counting only instances that already exist on this move: a live one
+		// activated later is not ticked until the replay reaches its own activation move.
+		bool bBlocked = false;
+		if (!AbilityClass->GetDefaultObject<UGMCAbility>()->bAllowMultipleInstances)
+		{
+			for (const TPair<int, UGMCAbility*>& Pair : ActiveAbilities)
+			{
+				if (Pair.Value && Pair.Value->IsA(AbilityClass) && Pair.Value->AbilityState != EAbilityState::Ended
+					&& Pair.Value->GetActivationMoveTime() <= ReplayStartMoveTime)
+				{
+					bBlocked = true;
+					break;
+				}
+			}
+		}
+		if (bBlocked)
+		{
+			continue;
+		}
+
+		UGMCAbility* Ability = NewAbilityInstance(AbilityClass, Rec.InputTag);
+		Ability->ResumeForReplay(this, Rec.AbilityID, Rec.InputAction.Get(), Rec.ActivationMoveTime, Rec.bServerConfirmed);
+		ActiveAbilities.Add(Rec.AbilityID, Ability);
+		UE_CLOG(GMASReplayResume::IsLog(), LogGMCAbilitySystem, Log,
+			TEXT("[ReplayResume] resume %s id=%d replay starts at move=%.3f (first run: %.3f to %.3f)"),
+			*GetNameSafe(AbilityClass), Rec.AbilityID, ReplayStartMoveTime, Rec.ActivationMoveTime, Rec.EndMoveTime);
+	}
 }
 
 bool UGMC_AbilitySystemComponent::ShouldBypassServerOperationQueue(const bool bIsAuthority,
@@ -1233,6 +1345,14 @@ void UGMC_AbilitySystemComponent::GenPredictionTick(float DeltaTime)
 	{
 		TRACE_CPUPROFILER_EVENT_SCOPE(GMAS_Pred_SendTaskDataToActiveAbility)
 		SendTaskDataToActiveAbility(true);
+	}
+
+	// Decided once per replay, on its first move: a later check would re-create an instance that ended
+	// earlier in this same replay.
+	if (GMASReplayResume::IsOn() && GMCMovementComponent->CL_IsReplaying()
+		&& GMCMovementComponent->CL_GetCurrentReplayMoveIndex() == 0)
+	{
+		ResumeEndedAbilitiesForReplay(ActionTimer);
 	}
 
 	{
@@ -1728,9 +1848,20 @@ void UGMC_AbilitySystemComponent::ProcessAttributes(bool bInGenPredictionTick)
 
 void UGMC_AbilitySystemComponent::TickActiveAbilities(float DeltaTime)
 {
+	const bool bReplayGate = GMASReplayResume::IsOn() && IsReplayingForGMASLogic();
 	for (const TPair<int, UGMCAbility*>& Ability : ActiveAbilities)
 	{
+		// A replayed move from before this instance's activation: in the first run it did not exist yet.
+		if (bReplayGate && Ability.Value->bReplayResumable && ActionTimer < Ability.Value->GetActivationMoveTime())
+		{
+			UE_CLOG(GMASReplayResume::IsLog() && GMCMovementComponent && GMCMovementComponent->CL_GetCurrentReplayMoveIndex() == 0,
+				LogGMCAbilitySystem, Log, TEXT("[ReplayResume] skip %s id=%d until move=%.3f (replay starts at %.3f)"),
+				*GetNameSafe(Ability.Value->GetClass()), Ability.Key, Ability.Value->GetActivationMoveTime(), ActionTimer);
+			continue;
+		}
+		TickingAbility = Ability.Value;
 		Ability.Value->Tick(DeltaTime);
+		TickingAbility = nullptr;
 	}
 }
 
